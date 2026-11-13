@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Databases & Local State
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite*-shm
+*.sqlite*-wal
+*.bak
+backups/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/dist/
+frontend/next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+
+# Logs
+*.log
+logs/
+
+# OS & IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

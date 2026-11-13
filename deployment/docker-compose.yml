@@ -1,0 +1,140 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: survival_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-survival_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-survival}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-survival_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-survival} -d ${POSTGRES_DB:-survival_agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: survival_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: survival_backend
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-survival}:${POSTGRES_PASSWORD:-survival_dev_password}@postgres:5432/${POSTGRES_DB:-survival_agent}
+      DATABASE_SYNC_URL: postgresql+psycopg://${POSTGRES_USER:-survival}:${POSTGRES_PASSWORD:-survival_dev_password}@postgres:5432/${POSTGRES_DB:-survival_agent}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  market_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: survival_market_worker
+    restart: unless-stopped
+    command: python -m app.workers.market_worker
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-survival}:${POSTGRES_PASSWORD:-survival_dev_password}@postgres:5432/${POSTGRES_DB:-survival_agent}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_ENABLED: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  trading_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: survival_trading_worker
+    restart: unless-stopped
+    command: python -m app.workers.trading_worker
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-survival}:${POSTGRES_PASSWORD:-survival_dev_password}@postgres:5432/${POSTGRES_DB:-survival_agent}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_ENABLED: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  monitoring_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: survival_monitoring_worker
+    restart: unless-stopped
+    command: python -m app.workers.monitoring_worker
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-survival}:${POSTGRES_PASSWORD:-survival_dev_password}@postgres:5432/${POSTGRES_DB:-survival_agent}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_ENABLED: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: survival_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost/api
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: survival_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:

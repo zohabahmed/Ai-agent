@@ -1,0 +1,17 @@
+[project]
+name = "survival-trading-agent"
+version = "0.1.0"
+description = "Autonomous survival-first cryptocurrency trading system with fractional Kelly sizing, regime detection, adaptive strategy intelligence, and hybrid human-in-the-loop governance."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+asyncio_mode = "auto"
+pythonpath = ["backend"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
