@@ -15,6 +15,7 @@ from app.database.repositories.trading_repo import TradingRepository
 from app.portfolio.balance_manager import BalanceManager
 from app.portfolio.equity_calculator import EquityCalculator, EquitySummary
 from app.portfolio.profit_manager import ProfitManager
+from app.risk.daily_baseline import sync_utc_day_baseline
 
 
 class PortfolioManager:
@@ -40,7 +41,15 @@ class PortfolioManager:
         market_type: str = "SPOT",
         leverage: int = 1,
         margin_used: Decimal = Decimal("0"),
+        initial_stop_distance_pct: Decimal | None = None,
+        atr_at_entry: Decimal | None = None,
+        sl_order_id: str | None = None,
+        tp_order_id: str | None = None,
+        market_regime: str | None = None,
     ) -> Position:
+        computed_stop_dist = initial_stop_distance_pct
+        if computed_stop_dist is None and stop_loss is not None and entry_price > 0:
+            computed_stop_dist = abs(entry_price - stop_loss) / entry_price
         pos = Position(
             account_id=account_id,
             symbol=symbol,
@@ -56,6 +65,11 @@ class PortfolioManager:
             current_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            initial_stop_distance_pct=computed_stop_dist,
+            atr_at_entry=atr_at_entry,
+            sl_order_id=sl_order_id,
+            tp_order_id=tp_order_id,
+            market_regime=market_regime,
             entry_fee=entry_fee,
             unrealized_pnl=-entry_fee,
             realized_pnl=Decimal("0"),
@@ -71,6 +85,7 @@ class PortfolioManager:
         position: Position,
         exit_price: Decimal,
         exit_fee: Decimal,
+        exit_reason: str | None = None,
     ) -> Decimal:
         gross_pnl = (
             (position.entry_price - exit_price) * position.quantity
@@ -78,8 +93,13 @@ class PortfolioManager:
             else (exit_price - position.entry_price) * position.quantity
         )
         net_realized = gross_pnl - position.entry_fee - exit_fee
+        denom = position.margin_used if position.margin_used and position.margin_used > 0 else (position.quantity * position.entry_price)
+        net_pct = (net_realized / denom).quantize(Decimal("0.00000001")) if denom > 0 else Decimal("0")
         position.current_price = exit_price
         position.realized_pnl = net_realized.quantize(Decimal("0.00000001"))
+        position.net_pnl_pct = net_pct
+        if exit_reason:
+            position.exit_reason = exit_reason
         position.unrealized_pnl = Decimal("0")
         position.status = "CLOSED"
         position.closed_at = datetime.now(timezone.utc)
@@ -139,6 +159,14 @@ class PortfolioManager:
         peak = max(account.peak_equity, equity.total_equity, Decimal("0.000001"))
         drawdown_pct = max(Decimal("0"), (peak - equity.total_equity) / peak)
 
+        sync_utc_day_baseline(account, equity.total_equity)
+        day_base = account.day_start_equity if account.day_start_equity > 0 else account.initial_capital
+        daily_pnl_pct = (
+            ((equity.total_equity - day_base) / day_base) * Decimal("100")
+            if day_base > 0
+            else Decimal("0")
+        )
+
         profit_summary = ProfitManager.calculate_withdrawable(
             realized_net_profit=realized_pnl,
             unrealized_pnl=equity.unrealized_pnl,
@@ -160,7 +188,7 @@ class PortfolioManager:
             unrealized_pnl=equity.unrealized_pnl,
             total_fees=equity.total_fees,
             drawdown_pct=drawdown_pct.quantize(Decimal("0.000001")),
-            daily_pnl_pct=Decimal("0"),
+            daily_pnl_pct=daily_pnl_pct.quantize(Decimal("0.0001")),
             withdrawable_amount=profit_summary.withdrawable_profit,
             is_simulated=is_simulated,
         )

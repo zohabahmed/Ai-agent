@@ -110,12 +110,20 @@ export default function AnalyticsAndSettingsPage() {
     }))
   ).map((s) => {
     const m = latestMetricsByStrat.get(s.name);
+    const liveOverall = "realized_overall" in s ? s.realized_overall : null;
+    const disabledRegimes = (strategies?.realized_regime_stats || []).filter(
+      (r) => r.strategy_name === s.name && r.auto_disabled
+    );
     return {
       ...s,
-      winRate: m ? m.win_rate : 0.55,
-      profitFactor: m ? m.profit_factor : 1.25,
-      sharpe: m ? m.sharpe_ratio : 1.1,
-      trades: m ? m.window_trades : 0,
+      enabled_in_runtime: s.enabled_in_runtime ?? ("enabled_in_registry" in s ? Boolean(s.enabled_in_registry) : true),
+      active_version: s.active_version || "1.0.0",
+      winRate: liveOverall && liveOverall.trade_count > 0 ? liveOverall.win_rate : m ? m.win_rate : 0.0,
+      profitFactor: m ? m.profit_factor : 0.0,
+      sharpe: m ? m.sharpe_ratio : 0.0,
+      trades: liveOverall ? liveOverall.trade_count : m ? m.window_trades : 0,
+      realizedExpectancyPct: liveOverall ? liveOverall.net_expectancy_pct : null,
+      autoDisabledCount: disabledRegimes.length,
     };
   });
 
@@ -288,8 +296,8 @@ export default function AnalyticsAndSettingsPage() {
                   <th className="pb-2">Status</th>
                   <th className="pb-2">Preferred Regimes</th>
                   <th className="pb-2">Win Rate</th>
-                  <th className="pb-2">Profit Factor</th>
-                  <th className="pb-2">Sharpe</th>
+                  <th className="pb-2">Realized Exp.</th>
+                  <th className="pb-2">Live Trades</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#161e2b]">
@@ -303,18 +311,34 @@ export default function AnalyticsAndSettingsPage() {
                     <td className="py-2.5">
                       <span
                         className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
-                          s.enabled_in_runtime ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-800 text-slate-400"
+                          s.autoDisabledCount > 0
+                            ? "bg-rose-500/20 text-rose-300"
+                            : s.enabled_in_runtime
+                              ? "bg-emerald-500/20 text-emerald-300"
+                              : "bg-slate-800 text-slate-400"
                         }`}
                       >
-                        {s.status}
+                        {s.autoDisabledCount > 0 ? `AUTO-DISABLED (${s.autoDisabledCount})` : s.status}
                       </span>
                     </td>
                     <td className="py-2.5 font-mono text-[10px] text-amber-300">
                       {s.preferred_regimes?.join(", ") || "ALL"}
                     </td>
-                    <td className="py-2.5 font-mono">{(s.winRate * 100).toFixed(1)}%</td>
-                    <td className="py-2.5 font-mono">{s.profitFactor.toFixed(2)}</td>
-                    <td className="py-2.5 font-mono">{s.sharpe.toFixed(2)}</td>
+                    <td className="py-2.5 font-mono">{s.trades > 0 ? `${(s.winRate * 100).toFixed(1)}%` : "—"}</td>
+                    <td
+                      className={`py-2.5 font-mono ${
+                        s.realizedExpectancyPct === null
+                          ? "text-slate-400"
+                          : s.realizedExpectancyPct >= 0
+                            ? "text-emerald-400"
+                            : "text-rose-400"
+                      }`}
+                    >
+                      {s.realizedExpectancyPct !== null
+                        ? `${(s.realizedExpectancyPct * 100).toFixed(3)}%`
+                        : "—"}
+                    </td>
+                    <td className="py-2.5 font-mono">{s.trades}</td>
                   </tr>
                 ))}
               </tbody>

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Any, Sequence
 
 from app.config import Settings, get_settings
 from app.exchanges.base_exchange import MarketRules
 from app.intelligence.opportunity_engine import EvaluatedOpportunity
+from app.risk.daily_baseline import compute_same_side_exposure
 from app.risk.drawdown_monitor import DrawdownMonitor, DrawdownStatus
 from app.risk.exposure_manager import ExposureManager
 from app.risk.kelly_calculator import KellyCalculator, KellyResult
@@ -48,6 +50,11 @@ class RiskManager:
         self.exposure_manager = ExposureManager(
             max_open_positions=self.settings.max_open_positions,
             max_leverage=self.settings.max_leverage,
+            max_single_asset_pct=(
+                self.settings.max_single_position_pct
+                if self.settings.max_open_positions > 1
+                else Decimal("0.95")
+            ),
         )
 
     def evaluate_trade(
@@ -69,6 +76,7 @@ class RiskManager:
         execution_error_pending: bool = False,
         market_type: str = "SPOT",
         leverage: int = 1,
+        open_positions: Sequence[Any] | None = None,
     ) -> RiskEvaluationResult:
         reasons: list[str] = []
         dd = self.drawdown_monitor.evaluate(
@@ -126,6 +134,13 @@ class RiskManager:
         norm_mkt = market_type.upper()
         effective_leverage = max(1, min(int(leverage), 5)) if norm_mkt == "FUTURES" else 1
 
+        # Cap single-position concentration when account has room for diversified slots (>= $20);
+        # micro wallets below $20 cannot split multiple $5+ venue minimums so keep slot diversification proportional.
+        single_cap = (
+            self.settings.max_single_position_pct
+            if (self.settings.max_open_positions > 1 and account_equity >= Decimal("20"))
+            else Decimal("0.95")
+        )
         pos_size = self.position_sizer.calculate(
             account_equity=account_equity,
             available_balance=available_balance,
@@ -133,19 +148,17 @@ class RiskManager:
             entry_price=sig.entry_price,
             stop_loss_price=sig.stop_loss,
             rules=rules,
+            max_exposure_pct=single_cap,
             regime_scale=verdict.exposure_scale,
             leverage=effective_leverage,
         )
         if not pos_size.is_viable:
             reasons.append(pos_size.reason)
 
-        exp_mgr = (
-            ExposureManager(
-                max_open_positions=self.settings.max_open_positions,
-                max_leverage=effective_leverage,
-            )
-            if norm_mkt == "FUTURES"
-            else self.exposure_manager
+        exp_mgr = ExposureManager(
+            max_open_positions=self.settings.max_open_positions,
+            max_leverage=effective_leverage if norm_mkt == "FUTURES" else self.settings.max_leverage,
+            max_single_asset_pct=single_cap,
         )
         exp = exp_mgr.check(
             account_equity=account_equity,
@@ -157,6 +170,22 @@ class RiskManager:
         )
         if not exp.allowed:
             reasons.extend(exp.reasons)
+
+        # Correlation / net-directional guard across open crypto positions
+        if open_positions and sig.action in {"BUY", "SELL"}:
+            same_count, same_notional = compute_same_side_exposure(open_positions, sig.action)
+            side_cap_count = min(self.settings.max_same_side_positions, self.settings.max_open_positions)
+            if self.settings.max_open_positions > 1 and same_count >= side_cap_count:
+                reasons.append(
+                    f"Net directional correlation limit reached: already holding {same_count} same-direction positions (max {side_cap_count})."
+                )
+            if account_equity >= Decimal("20"):
+                buying_power = account_equity * Decimal(effective_leverage)
+                max_side_notional = buying_power * self.settings.max_same_side_exposure_pct
+                if (same_notional + pos_size.capped_notional_usd) > max_side_notional:
+                    reasons.append(
+                        f"Same-side correlated exposure ${(same_notional + pos_size.capped_notional_usd):.2f} exceeds cap ${max_side_notional:.2f} ({float(self.settings.max_same_side_exposure_pct)*100:.0f}%)."
+                    )
 
         approved = len(reasons) == 0 and verdict.state != SurvivalState.HALTED
         return RiskEvaluationResult(

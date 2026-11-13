@@ -249,9 +249,16 @@ async def test_autonomous_loop_opens_trade_without_override_and_locks_trailing_p
         assert len(open_pos) >= 1
         pos = open_pos[0]
         entry_px = pos.entry_price
+        orig_qty = pos.quantity
+        assert pos.stop_loss is not None and pos.take_profit is not None
+        stop_dist_pct = abs(entry_px - pos.stop_loss) / entry_px
+        tp_dist_pct = abs(pos.take_profit - entry_px) / entry_px
+        assert stop_dist_pct >= Decimal("0.0075")
+        assert tp_dist_pct >= stop_dist_pct * Decimal("1.95")
 
-        # Simulate runner surging +0.9% (crosses +0.45% fast_book arming threshold -> should stay open to capture more gain)
-        surge_px = (entry_px * Decimal("1.009")).quantize(Decimal("0.01"))
+        # Simulate runner surging beyond +1R -> triggers 50% SCALE_OUT_1R & moves stop to breakeven+fees
+        surge_mult = Decimal("1") + (stop_dist_pct * Decimal("1.15"))
+        surge_px = (entry_px * surge_mult).quantize(Decimal("0.01"))
         for sym in mock_exchange.candles_by_symbol:
             last_bar = dict(mock_exchange.candles_by_symbol[sym][-1])
             last_bar["close"] = surge_px
@@ -262,40 +269,56 @@ async def test_autonomous_loop_opens_trade_without_override_and_locks_trailing_p
         await loop.run_cycle(session, allow_historical=True)
         open_after_surge = await repo.get_open_positions(acc.id)
         assert len(open_after_surge) >= 1
-        # Stop loss must have ratcheted up to breakeven+fee protection!
-        assert open_after_surge[0].stop_loss is not None
-        assert open_after_surge[0].stop_loss > entry_px
+        pos_after_surge = open_after_surge[0]
+        # Stop loss must have ratcheted up to breakeven+fee protection and 50% scaled out!
+        assert pos_after_surge.stop_loss is not None
+        assert pos_after_surge.stop_loss > entry_px
+        assert pos_after_surge.scaled_out is True
+        assert pos_after_surge.quantity < orig_qty
 
-        # Now simulate a -0.35% pullback from peak (+0.9% -> +0.55%): must close automatically to lock trailing profit!
-        pullback_px = (entry_px * Decimal("1.0055")).quantize(Decimal("0.01"))
+        # Now simulate pullback into the protected breakeven/ATR trail stop -> runner closes automatically!
+        pullback_px = (pos_after_surge.stop_loss * Decimal("0.999")).quantize(Decimal("0.01"))
         for sym in mock_exchange.candles_by_symbol:
             last_bar = dict(mock_exchange.candles_by_symbol[sym][-1])
             last_bar["close"] = pullback_px
+            last_bar["low"] = pullback_px * Decimal("0.999")
             last_bar["timestamp"] = datetime.now(timezone.utc)
             mock_exchange.candles_by_symbol[sym][-1] = last_bar
 
         await loop.run_cycle(session, allow_historical=True)
-        events = await repo.get_recent_events(limit=15)
-        assert any("TRAILING_PROFIT_LOCK" in ev.message or "TRAILING_PROFIT_LOCK" in str(ev.payload) for ev in events)
+        events = await repo.get_recent_events(limit=20)
+        assert any("SCALE_OUT_1R" in ev.message or "SCALE_OUT_1R" in str(ev.payload) for ev in events)
+        assert any(
+            reason in ev.message or reason in str(ev.payload)
+            for ev in events
+            for reason in ("BREAKEVEN_LOCK", "ATR_TRAILING_STOP")
+        )
 
 
 @pytest.mark.asyncio
 async def test_one_dollar_paper_trade_and_partial_profit_booking(db_manager, mock_exchange, monkeypatch):
-    """Micro $1.00 Paper account can execute BTC/USDT futures trades and partially book profit."""
+    """Realistic PAPER mode enforces real $5 Binance minimums (rejecting $1 micro) and executes & partial-closes cleanly at $500."""
     from datetime import timedelta
-    from app.backtesting.historical_data import HistoricalDataLoader
     from app.database.repositories.trading_repo import TradingRepository
     from app.exchanges.base_exchange import MarketRules, OrderBook, OrderBookLevel, Ticker
+    from app.intelligence.derivatives_intelligence import (
+        DerivativesIntelligenceService,
+        DerivativesSentimentReport,
+    )
 
-    # Prepare upward-trending fresh candles for BTC/USDT on mock_exchange
-    bars = HistoricalDataLoader.generate_synthetic_regime_series(bars=220, seed=7)
+    # Prepare oscillating uptrend candles across BTC/ETH/SOL/BNB so separated OOS stats have sufficient trades offline
+    bars = _build_oscillating_uptrend_candles(320)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     for i, c in enumerate(bars):
         c["timestamp"] = now - timedelta(minutes=15 * (len(bars) - 1 - i))
-    mock_exchange.candles_by_symbol["BTC/USDT"] = bars
+    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"):
+        mock_exchange.candles_by_symbol[sym] = [dict(c) for c in bars]
 
     async def fake_ohlcv(self, symbol: str, timeframe: str, since=None, limit: int = 200):
-        return await mock_exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        norm = "BTC/USDT" if symbol.startswith("BTC") else symbol
+        if norm in mock_exchange.candles_by_symbol:
+            return mock_exchange.candles_by_symbol[norm][-limit:]
+        return bars[-limit:]
 
     async def fake_ticker(self, symbol: str):
         last = bars[-1]["close"]
@@ -318,7 +341,6 @@ async def test_one_dollar_paper_trade_and_partial_profit_booking(db_manager, moc
         )
 
     async def fake_market_rules(self, symbol: str):
-        # Even when the underlying venue advertises a $5.00 live minimum, Paper Micro-Futures must still work at $1.00
         return MarketRules(
             symbol=symbol,
             base_asset="BTC",
@@ -335,11 +357,26 @@ async def test_one_dollar_paper_trade_and_partial_profit_booking(db_manager, moc
     async def fake_close(self):
         return None
 
+    async def fake_deriv(self, symbol: str, df=None):
+        return DerivativesSentimentReport(
+            symbol=symbol,
+            source="mock-offline",
+            funding_rate_pct=0.008,
+            derivatives_bias="NEUTRAL",
+            open_interest_usd=250_000_000.0,
+            long_short_ratio=1.05,
+            crowding_state="BALANCED",
+            allow_long=True,
+            allow_short=True,
+            rationale="Offline mock balanced derivatives state.",
+        )
+
     monkeypatch.setattr(CCXTExchangeAdapter, "fetch_ohlcv", fake_ohlcv)
     monkeypatch.setattr(CCXTExchangeAdapter, "fetch_ticker", fake_ticker)
     monkeypatch.setattr(CCXTExchangeAdapter, "fetch_order_book", fake_order_book)
     monkeypatch.setattr(CCXTExchangeAdapter, "get_market_rules", fake_market_rules)
     monkeypatch.setattr(CCXTExchangeAdapter, "close", fake_close)
+    monkeypatch.setattr(DerivativesIntelligenceService, "fetch_derivatives_sentiment", fake_deriv)
 
     await bootstrap_initial_state()
     app = create_app()
@@ -353,17 +390,31 @@ async def test_one_dollar_paper_trade_and_partial_profit_booking(db_manager, moc
         assert tok_res.status_code == 200
         headers = {"Authorization": f"Bearer {tok_res.json()['access_token']}"}
 
-        reset_res = await client.post(
+        # 1. With $1.00 capital on Binance PAPER, realistic exchange rules must reject rather than faking $0.25 fills
+        micro_reset = await client.post(
             "/api/portfolio/reset-paper",
             headers=headers,
             json={"initial_capital": 1.0, "switch_to_paper": True},
         )
-        assert reset_res.status_code == 200
-        assert reset_res.json()["total_equity"] == pytest.approx(1.0)
-
+        assert micro_reset.status_code == 200
         start_res = await client.post("/api/trading/start", headers=headers)
         assert start_res.status_code == 200
-        assert start_res.json()["is_trading_active"] is True
+
+        micro_trade = await client.post(
+            "/api/trading/test-paper-trade?symbol=BTC/USDT&timeframe=15m&side=LONG",
+            headers=headers,
+        )
+        assert micro_trade.status_code == 200
+        assert micro_trade.json()["status"] == "rejected"
+
+        # 2. Reset to realistic $500.00 PAPER capital -> real $5+ Binance minimum executes cleanly & supports partial close
+        reset_res = await client.post(
+            "/api/portfolio/reset-paper",
+            headers=headers,
+            json={"initial_capital": 500.0, "switch_to_paper": True},
+        )
+        assert reset_res.status_code == 200
+        assert reset_res.json()["total_equity"] == pytest.approx(500.0)
 
         trade_res = await client.post(
             "/api/trading/test-paper-trade?symbol=BTC/USDT&timeframe=15m&side=LONG",
@@ -373,15 +424,11 @@ async def test_one_dollar_paper_trade_and_partial_profit_booking(db_manager, moc
         trade_body = trade_res.json()
         assert trade_body["status"] == "executed", trade_body
         exec_order = trade_body["trade"]
-        assert 0.25 <= exec_order["notional_usd"] <= 0.99
+        assert exec_order["notional_usd"] >= 5.0
 
         async with db_manager.session() as session:
             repo = TradingRepository(session)
             acc = await repo.get_or_create_default_account()
-            usdt = next((b for b in await repo.get_balances(acc.id) if b.asset == "USDT"), None)
-            assert usdt is not None
-            # Balance must stay in the $1.00 micro range rather than being inflated to $1,000
-            assert usdt.total <= Decimal("1.05")
             open_positions = await repo.get_open_positions(acc.id)
             assert len(open_positions) == 1
             pos_id = str(open_positions[0].id)

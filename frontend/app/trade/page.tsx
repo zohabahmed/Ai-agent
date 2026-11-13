@@ -309,6 +309,20 @@ export default function ActiveTradeOnlyPage() {
                   {selectedTrade.exchange} • {selectedTrade.trading_mode} • Duration:{" "}
                   <strong className="text-slate-200">{formatDuration(selectedTrade.duration_seconds)}</strong>
                 </span>
+                {selectedTrade.exchange_protected ? (
+                  <span className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-bold text-emerald-300">
+                    Exchange STOP_MARKET + TP Protected
+                  </span>
+                ) : (
+                  <span className="rounded-md border border-slate-700 bg-slate-800/70 px-2.5 py-1 text-[11px] font-semibold text-slate-300">
+                    Simulated Paper Exits
+                  </span>
+                )}
+                {selectedTrade.scaled_out && (
+                  <span className="rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-bold text-amber-300">
+                    1R Scaled Out · 1.2x ATR Trail Active
+                  </span>
+                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
@@ -487,7 +501,7 @@ export default function ActiveTradeOnlyPage() {
                   sub={`Maint $${selectedTrade.maintenance_margin_usd.toFixed(2)} (${selectedTrade.maintenance_margin_rate_pct.toFixed(1)}%)`}
                 />
                 <MetricTile
-                  label="Take Profit (TP)"
+                  label={`Take Profit (TP)${selectedTrade.tp_order_id ? ` · #${selectedTrade.tp_order_id.slice(-6)}` : ""}`}
                   value={selectedTrade.take_profit ? `$${fmtUsd(selectedTrade.take_profit, pxDigits(selectedTrade.take_profit))}` : "Not Set"}
                   valueClass="text-emerald-400"
                   borderClass="border-emerald-500/30 bg-emerald-950/15"
@@ -498,7 +512,7 @@ export default function ActiveTradeOnlyPage() {
                   }
                 />
                 <MetricTile
-                  label={`Stop Loss${selectedTrade.reward_risk_ratio ? ` · R:R ${selectedTrade.reward_risk_ratio}:1` : ""}`}
+                  label={`Stop Loss${selectedTrade.reward_risk_ratio ? ` · R:R ${selectedTrade.reward_risk_ratio}:1` : ""}${selectedTrade.sl_order_id ? ` · #${selectedTrade.sl_order_id.slice(-6)}` : ""}`}
                   value={selectedTrade.stop_loss ? `$${fmtUsd(selectedTrade.stop_loss, pxDigits(selectedTrade.stop_loss))}` : "Not Set"}
                   valueClass="text-rose-400"
                   borderClass="border-rose-500/30 bg-rose-950/15"

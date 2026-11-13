@@ -69,11 +69,25 @@ class Settings(BaseSettings):
     )
     timeframes: str = "5m,15m,1h,4h"
 
-    # Short-horizon scalp policy: max hold 60 min, book profit fast
-    max_hold_minutes: int = Field(default=60, ge=5, le=240)
-    quick_take_profit_pct: Decimal = Field(default=Decimal("0.015"), gt=Decimal("0"))
-    quick_stop_loss_pct: Decimal = Field(default=Decimal("0.006"), gt=Decimal("0"))
-    fast_book_profit_pct: Decimal = Field(default=Decimal("0.0045"), gt=Decimal("0"))
+    # ATR-scaled risk/reward & runner policy (never choke winners inside 15m noise)
+    max_hold_minutes: int = Field(default=240, ge=15, le=1440)
+    mean_reversion_max_hold_minutes: int = Field(default=60, ge=15, le=360)
+    quick_take_profit_pct: Decimal = Field(default=Decimal("0.025"), gt=Decimal("0"))
+    quick_stop_loss_pct: Decimal = Field(default=Decimal("0.012"), gt=Decimal("0"))
+    min_stop_loss_pct: Decimal = Field(default=Decimal("0.008"), gt=Decimal("0"))
+    max_stop_loss_pct: Decimal = Field(default=Decimal("0.025"), gt=Decimal("0"))
+    min_reward_risk_ratio: Decimal = Field(default=Decimal("2.0"), gt=Decimal("1.0"))
+    scale_out_r_multiple: Decimal = Field(default=Decimal("1.0"), gt=Decimal("0"))
+    scale_out_fraction: Decimal = Field(default=Decimal("0.50"), gt=Decimal("0"), lt=Decimal("1"))
+    atr_trail_multiplier: Decimal = Field(default=Decimal("1.2"), gt=Decimal("0"))
+    fast_book_profit_pct: Decimal = Field(default=Decimal("0.012"), gt=Decimal("0"))
+    # Realistic paper mode enforces venue minimums; micro relaxation requires explicit opt-out
+    paper_enforce_real_exchange_rules: bool = Field(default=True)
+    # Per-position diversification & directional correlation limits
+    max_single_position_pct: Decimal = Field(default=Decimal("0.40"), gt=Decimal("0"), le=Decimal("0.95"))
+    max_same_side_positions: int = Field(default=2, ge=1, le=5)
+    max_same_side_exposure_pct: Decimal = Field(default=Decimal("0.65"), gt=Decimal("0"), le=Decimal("0.95"))
+    min_trades_for_expectancy_disable: int = Field(default=50, ge=10, le=500)
 
     # Risk & Survival Limits (Centralized)
     kelly_mode: KellyMode = KellyMode.NORMAL
@@ -116,9 +130,9 @@ class Settings(BaseSettings):
 
     @field_validator("max_leverage")
     @classmethod
-    def enforce_spot_no_leverage(cls, v: int) -> int:
+    def enforce_base_leverage_one(cls, v: int) -> int:
         if v != 1:
-            raise ValueError("Leverage > 1 is strictly prohibited in spot survival mode.")
+            raise ValueError("Default account base leverage must remain 1x in isolated Futures survival mode.")
         return v
 
     @field_validator("withdrawal_approval_required")

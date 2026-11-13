@@ -30,9 +30,27 @@ async def list_strategies(
     session: Annotated[AsyncSession, Depends(get_db_session)],
     registry: Annotated[StrategyRegistry, Depends(get_strategy_registry)],
 ) -> dict[str, Any]:
+    from app.config import get_settings
+
+    settings = get_settings()
     repo = TradingRepository(session)
+    account = await repo.get_or_create_default_account()
     db_strats = await repo.list_strategies()
     versions = await repo.get_strategy_versions(limit=50)
+    realized_stats = await repo.get_strategy_regime_realized_stats(account.id)
+    regime_stats_list = [
+        {
+            "strategy_name": strat_name,
+            "regime": reg_name,
+            **vals,
+            "auto_disabled": (
+                vals["trade_count"] >= settings.min_trades_for_expectancy_disable
+                and vals["net_expectancy_pct"] < 0
+            ),
+        }
+        for (strat_name, reg_name), vals in sorted(realized_stats.items())
+        if reg_name != "ALL"
+    ]
     return {
         "strategies": [
             {
@@ -45,10 +63,12 @@ async def list_strategies(
                 "enabled_in_registry": registry.is_enabled(s.name),
                 "preferred_regimes": s.preferred_regimes,
                 "parameters": s.parameters,
+                "realized_overall": realized_stats.get((s.name, "ALL")),
                 "updated_at": s.updated_at.isoformat(),
             }
             for s in db_strats
         ],
+        "realized_regime_stats": regime_stats_list,
         "versions": [
             {
                 "id": str(v.id),

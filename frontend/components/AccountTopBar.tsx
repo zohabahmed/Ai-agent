@@ -122,7 +122,12 @@ export default function AccountTopBar({
             ${overview.current_equity.toFixed(4)}
           </div>
           <div className="text-[11px] text-slate-400">
-            Baseline: ${overview.initial_capital.toFixed(2)}
+            UTC Day Base: ${(overview.day_start_equity ?? overview.initial_capital).toFixed(2)}
+            {typeof overview.daily_pnl_pct === "number" ? (
+              <span className={overview.daily_pnl_pct >= 0 ? " text-emerald-400" : " text-rose-400"}>
+                {" "}({overview.daily_pnl_pct >= 0 ? "+" : ""}{overview.daily_pnl_pct.toFixed(2)}%)
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -218,7 +223,8 @@ export default function AccountTopBar({
             -{(overview.current_drawdown_pct * 100).toFixed(2)}%
           </div>
           <div className="text-[11px] text-slate-400">
-            Max Allowed: -{(survival.max_drawdown * 100).toFixed(0)}%
+            Peak Cap: -{(survival.max_drawdown * 100).toFixed(0)}% · Day Loss -
+            {((overview.current_daily_loss_pct ?? 0) * 100).toFixed(2)}% / -{(survival.max_daily_loss * 100).toFixed(1)}%
           </div>
         </div>
 

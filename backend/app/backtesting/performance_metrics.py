@@ -15,6 +15,7 @@ class TradeRecord:
     fees: float
     duration_bars: int
     regime: str = "UNKNOWN"
+    exit_reason: str = "CLOSED"
 
 
 @dataclass(frozen=True)

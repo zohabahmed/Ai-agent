@@ -262,6 +262,8 @@ class ExchangeConnectionService:
         if reset_baseline_from_exchange or (transitioning_from_paper and switch_to_read_only_if_paper):
             baseline = total_quote if total_quote > Decimal("0") else Decimal("0.01")
             account.initial_capital = baseline
+            account.day_start_equity = baseline
+            account.day_start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             account.peak_equity = baseline
 
         is_sim = account.trading_mode in {TradingMode.PAPER.value, TradingMode.BACKTEST.value}

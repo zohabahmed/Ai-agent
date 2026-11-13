@@ -64,6 +64,8 @@ class TradingRepository:
             leverage=1,
             trading_mode=trading_mode,
             initial_capital=initial_capital,
+            day_start_equity=initial_capital,
+            day_start_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             peak_equity=initial_capital,
             quote_currency=quote_currency,
             is_trading_active=False,
@@ -334,3 +336,51 @@ class TradingRepository:
         stmt = select(TradeSignal).order_by(desc(TradeSignal.created_at)).limit(limit)
         res = await self.session.execute(stmt)
         return list(res.scalars().all())
+
+    async def get_closed_positions(self, account_id: uuid.UUID, limit: int = 500) -> list[Position]:
+        stmt = (
+            select(Position)
+            .where(Position.account_id == account_id, Position.status == "CLOSED")
+            .order_by(desc(Position.closed_at))
+            .limit(limit)
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def get_strategy_regime_realized_stats(
+        self,
+        account_id: uuid.UUID,
+        *,
+        limit: int = 500,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Aggregate closed trade count, wins, losses, avg win/loss %, and net expectancy by (strategy, regime)."""
+        rows = await self.get_closed_positions(account_id, limit=limit)
+        buckets: dict[tuple[str, str], list[float]] = {}
+        for pos in rows:
+            if pos.net_pnl_pct is not None:
+                ret_pct = float(pos.net_pnl_pct)
+            else:
+                denom = float(pos.margin_used or (pos.quantity * pos.entry_price) or Decimal("0"))
+                if denom <= 0:
+                    continue
+                ret_pct = float(pos.realized_pnl) / denom
+            regime_key = str(pos.market_regime or "ALL").upper()
+            for key in [(pos.strategy_name, regime_key), (pos.strategy_name, "ALL")]:
+                buckets.setdefault(key, []).append(ret_pct)
+
+        summary: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, rets in buckets.items():
+            wins = [r for r in rets if r > 0]
+            losses = [abs(r) for r in rets if r <= 0]
+            count = len(rets)
+            net_exp = sum(rets) / count if count > 0 else 0.0
+            summary[key] = {
+                "trade_count": count,
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": round(len(wins) / count, 4) if count > 0 else 0.0,
+                "avg_win_pct": (sum(wins) / len(wins)) if wins else 0.0,
+                "avg_loss_pct": (sum(losses) / len(losses)) if losses else 0.0,
+                "net_expectancy_pct": round(net_exp, 6),
+            }
+        return summary

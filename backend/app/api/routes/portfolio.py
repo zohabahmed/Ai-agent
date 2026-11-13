@@ -190,6 +190,8 @@ async def deposit_simulated_capital(
 
     if asset == account.quote_currency:
         account.initial_capital = account.initial_capital + body.amount
+        account.day_start_equity = max(account.day_start_equity + body.amount, Decimal("0.01"))
+        account.day_start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         account.peak_equity = max(account.peak_equity, account.initial_capital)
 
     open_positions = await repo.get_open_positions(account.id)
@@ -296,6 +298,8 @@ async def reset_paper_testing_account(
     )
 
     account.initial_capital = body.initial_capital
+    account.day_start_equity = body.initial_capital
+    account.day_start_date = now.strftime("%Y-%m-%d")
     account.peak_equity = body.initial_capital
     account.emergency_stopped = False
     account.is_trading_active = True

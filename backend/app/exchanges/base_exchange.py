@@ -91,11 +91,12 @@ class ExchangeBalance:
 class OrderRequest:
     symbol: str
     side: str  # BUY / SELL
-    order_type: str  # MARKET / LIMIT
+    order_type: str  # MARKET / LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET
     quantity: Decimal
     client_order_id: str
     price: Decimal | None = None
     reduce_only: bool = False
+    stop_price: Decimal | None = None
 
 
 @dataclass(frozen=True)

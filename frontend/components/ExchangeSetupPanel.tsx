@@ -312,7 +312,7 @@ export function ExchangeSetupPanel({
             <div className="space-y-3 rounded-lg border border-emerald-500/40 bg-emerald-950/25 p-3">
               <div className="font-semibold text-emerald-300">
                 LIVE_TRADING ARMED · Real {(exchangeStatus?.exchange_id || exchangeId).toUpperCase()} USD-M Futures orders are authorized within Survival limits
-                (1x Isolated Futures only, max 60m hold, withdrawals disabled).
+                (1x Isolated Futures default, UTC daily loss cap, exchange-side SL/TP triggers, withdrawals disabled).
               </div>
               <button
                 type="button"

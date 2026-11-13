@@ -104,6 +104,10 @@ export interface DashboardData {
   };
   overview: {
     initial_capital: number;
+    day_start_equity?: number;
+    day_start_date?: string | null;
+    daily_pnl_pct?: number;
+    current_daily_loss_pct?: number;
     current_equity: number;
     available_balance: number;
     locked_balance: number;
@@ -122,6 +126,8 @@ export interface DashboardData {
     max_daily_loss: number;
     max_drawdown: number;
     max_open_positions: number;
+    max_single_position_pct?: number;
+    max_same_side_positions?: number;
     open_positions_count: number;
     emergency_stopped: boolean;
   };
@@ -296,10 +302,32 @@ export interface StrategiesData {
     display_name: string;
     category: string;
     status: string;
-    active_version: string;
+    active_version?: string;
     parameters: Record<string, unknown>;
     preferred_regimes: string[];
-    enabled_in_runtime: boolean;
+    enabled_in_runtime?: boolean;
+    enabled_in_registry?: boolean;
+    realized_overall?: {
+      trade_count: number;
+      wins: number;
+      losses: number;
+      win_rate: number;
+      avg_win_pct: number;
+      avg_loss_pct: number;
+      net_expectancy_pct: number;
+    } | null;
+  }>;
+  realized_regime_stats?: Array<{
+    strategy_name: string;
+    regime: string;
+    trade_count: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    avg_win_pct: number;
+    avg_loss_pct: number;
+    net_expectancy_pct: number;
+    auto_disabled: boolean;
   }>;
   recent_metrics: Array<{
     id: string;
@@ -395,6 +423,12 @@ export interface ActiveTradeDetailed {
   distance_to_liq_pct: number;
   stop_loss: number | null;
   take_profit: number | null;
+  sl_order_id?: string | null;
+  tp_order_id?: string | null;
+  exchange_protected?: boolean;
+  scaled_out?: boolean;
+  exit_reason?: string | null;
+  market_regime?: string | null;
   distance_to_sl_pct: number | null;
   distance_to_tp_pct: number | null;
   expected_tp_profit_usd: number | null;

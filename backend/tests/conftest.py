@@ -39,6 +39,8 @@ class MockExchange(BaseExchange):
         }
         self.submitted_orders: list[OrderRequest] = []
         self.canceled_orders: list[str] = []
+        self.protective_orders: dict[str, OrderResult] = {}
+        self.fetched_order_overrides: dict[str, OrderResult] = {}
 
     async def connect(self) -> None:
         return None
@@ -106,23 +108,29 @@ class MockExchange(BaseExchange):
         if self.fail_create_order:
             raise ExchangeError("Simulated ambiguous network timeout during order submission.")
         self.submitted_orders.append(request)
-        return OrderResult(
-            exchange_order_id=f"mock-{uuid.uuid4().hex[:10]}",
+        oid = f"mock-{uuid.uuid4().hex[:10]}"
+        is_trigger = request.order_type.upper() in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}
+        res = OrderResult(
+            exchange_order_id=oid,
             client_order_id=request.client_order_id,
             symbol=request.symbol,
             side=request.side,
             order_type=request.order_type,
-            status="FILLED",
+            status="OPEN" if is_trigger else "FILLED",
             requested_quantity=request.quantity,
-            filled_quantity=request.quantity,
-            average_price=request.price or Decimal("65000"),
-            fee=Decimal("0.01"),
+            filled_quantity=Decimal("0") if is_trigger else request.quantity,
+            average_price=None if is_trigger else (request.price or Decimal("65000")),
+            fee=Decimal("0") if is_trigger else Decimal("0.01"),
             fee_asset="USDT",
             timestamp=datetime.now(timezone.utc),
         )
+        if is_trigger:
+            self.protective_orders[oid] = res
+        return res
 
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> OrderResult:
         self.canceled_orders.append(exchange_order_id)
+        self.protective_orders.pop(exchange_order_id, None)
         return OrderResult(
             exchange_order_id=exchange_order_id,
             client_order_id=exchange_order_id,
@@ -139,6 +147,10 @@ class MockExchange(BaseExchange):
         )
 
     async def fetch_order(self, exchange_order_id: str, symbol: str) -> OrderResult:
+        if exchange_order_id in self.fetched_order_overrides:
+            return self.fetched_order_overrides[exchange_order_id]
+        if exchange_order_id in self.protective_orders:
+            return self.protective_orders[exchange_order_id]
         return OrderResult(
             exchange_order_id=exchange_order_id,
             client_order_id=exchange_order_id,

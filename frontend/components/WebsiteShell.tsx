@@ -319,7 +319,7 @@ export function WebsiteShell({ children }: { children: React.ReactNode }) {
       <footer className="border-t border-[#1f2937] bg-[#0c1118] px-4 py-3 text-[11px] text-slate-400">
         <div className="mx-auto flex max-w-[1700px] flex-wrap items-center justify-between gap-3">
           <span>
-            <strong className="text-slate-200">SurvivalX</strong> · Futures Isolated · Fractional Kelly Risk Governor · Max 60m Hold · Trailing Profit Lock
+            <strong className="text-slate-200">SurvivalX</strong> · Futures Isolated · Fractional Kelly Risk Governor · ATR Stops (0.8–2.5%) · 1R Scale-Out &amp; 1.2x ATR Trail · Exchange Triggers
           </span>
           <div className="flex items-center gap-4">
             <Link href="/" className="hover:text-amber-300 transition">

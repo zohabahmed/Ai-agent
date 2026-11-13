@@ -44,8 +44,8 @@ const PIPELINE_STEPS = [
   },
   {
     step: "06",
-    title: "Isolated Futures Execution & Fast Profit Lock",
-    desc: "Places isolated Futures orders (1x default, automatic 2x–5x only if a small balance needs to clear a venue order floor), arms a trailing lock at +0.45%, targets +1.5% TP / -0.6% SL, and hard-closes by 60 min.",
+    title: "Isolated Futures Execution, Exchange Stops & 1R Scale-Out",
+    desc: "Places isolated Futures orders (1x default; places exchange-side reduce-only STOP_MARKET & TAKE_PROFIT_MARKET orders on Live/Testnet), uses ATR-scaled SL (0.8%–2.5%) & >=2.0R TP, books 50% at +1R to breakeven+fees, and trails runners at 1.2x ATR.",
   },
 ];
 
@@ -98,7 +98,7 @@ export default function AgentGuidePage() {
               Autonomous Multi-Coin Futures Agent Built Around Capital Preservation
             </h1>
             <p className="text-xs md:text-sm text-slate-300 leading-relaxed">
-              SurvivalX scans live Futures pairs globally, tests setups through statistical confluence and Net Expected Value after fees, sizes positions with Fractional Kelly Criterion, enforces an independent Survival Governor, and exits fast inside a 60-minute window.
+              SurvivalX scans live Futures pairs globally, tests setups on separated historical walk-forward splits plus HTF 1h/BTC/derivatives confluence and Net Expected Value from realized trade outcomes, sizes positions with Fractional Kelly Criterion, enforces an independent Survival Governor, and manages exits with ATR stops &amp; exchange triggers. No trading bot guarantees profit — always validate 100+ trades in realistic $200–$1,000 Paper mode before risking live capital.
             </p>
           </div>
 
@@ -131,10 +131,10 @@ export default function AgentGuidePage() {
         <div className="mt-5 grid grid-cols-2 gap-3 border-t border-[#1f2937] pt-4 sm:grid-cols-3 lg:grid-cols-6 font-mono text-xs">
           <RuleMetric label="Kelly Mode / Mult" value={`${sv?.kelly_mode || "NORMAL"} (${((sv?.kelly_multiplier ?? 0.2) * 100).toFixed(0)}%)`} />
           <RuleMetric label="Max Risk / Trade" value={`${((sv?.max_risk_per_trade ?? 0.015) * 100).toFixed(2)}%`} />
-          <RuleMetric label="Daily Loss Limit" value={`-${((sv?.max_daily_loss ?? 0.01) * 100).toFixed(2)}%`} />
+          <RuleMetric label="Daily Loss Limit (UTC 00:00)" value={`-${((sv?.max_daily_loss ?? 0.01) * 100).toFixed(2)}%`} />
           <RuleMetric label="Max Drawdown Cap" value={`-${((sv?.max_drawdown ?? 0.05) * 100).toFixed(0)}%`} />
-          <RuleMetric label="Max Concurrent Trades" value={`${sv?.max_open_positions ?? 3} Futures`} />
-          <RuleMetric label="Margin / Hold Limit" value="Isolated · 60 min" />
+          <RuleMetric label="Concurrent / Same-Side" value={`${sv?.max_open_positions ?? 3} Futures (Max ${sv?.max_same_side_positions ?? 2} same-side)`} />
+          <RuleMetric label="Margin / Hold Limit" value="Isolated · 240m (60m MR)" />
         </div>
       </section>
 
@@ -184,10 +184,10 @@ export default function AgentGuidePage() {
           </h2>
           <ul className="space-y-2.5 text-xs text-slate-300">
             <li className="rounded-lg border border-[#1f2937] bg-[#080c12] p-3">
-              <strong className="text-emerald-300">Trailing Profit Lock (+0.45%):</strong> Once a trade moves +0.45% in your favor, Stop-Loss ratchets to breakeven+fees (+0.25%) and trails peak pullbacks while letting winners run toward the +1.5% Take-Profit.
+              <strong className="text-emerald-300">ATR Stops (0.8%–2.5%) &amp; +1R 50% Scale-Out:</strong> Stops scale to 1.5x ATR inside 0.8%–2.5% with &gt;=2.0R Take-Profit and exchange-side STOP_MARKET / TAKE_PROFIT_MARKET orders. Once price reaches +1.0R, 50% is booked, the SL ratchets on-exchange to breakeven+fees (+0.20%), and the remaining runner trails at 1.2x ATR.
             </li>
             <li className="rounded-lg border border-[#1f2937] bg-[#080c12] p-3">
-              <strong className="text-amber-300">30m / 60m Time Exit:</strong> After 30 minutes any fee-covering gain (+0.18%) is booked cleanly; every trade is strictly closed by the 60-minute hard cap (or anytime manually via Book 25% / Book 50% / Stop).
+              <strong className="text-amber-300">Max Hold &amp; Auto-Disable Evidence Gate:</strong> Trend and breakout trades hold up to 240 minutes (60 min for mean-reversion) with manual Book 25% / Book 50% / Stop always available. Any strategy-regime pair with &gt;=50 closed live trades and negative net expectancy is auto-disabled.
             </li>
             <li className="rounded-lg border border-[#1f2937] bg-[#080c12] p-3">
               <strong className="text-white">Any-Positive-Balance Support:</strong> Keeps 1x isolated margin by default; if your Futures wallet ($4.95, $2+) sits below an exchange minimum order floor (such as Binance USD-M $5 contracts), it automatically applies the lowest isolated multiple (2x–5x), or runs native $1+ at 1x on MEXC / KuCoin Futures / Gate.

@@ -26,6 +26,7 @@ from app.market.market_cache import MarketCache
 from app.portfolio.balance_manager import BalanceManager
 from app.portfolio.equity_calculator import EquityCalculator
 from app.portfolio.profit_manager import ProfitManager
+from app.risk.daily_baseline import sync_utc_day_baseline
 from app.risk.survival_controller import SurvivalController
 from app.security.audit_logger import AuditLogger
 from app.security.authentication import create_access_token, verify_password
@@ -132,6 +133,10 @@ async def get_dashboard(
     )
     peak = max(account.peak_equity, eq.total_equity, Decimal("0.000001"))
     drawdown_pct = max(Decimal("0"), (peak - eq.total_equity) / peak)
+    sync_utc_day_baseline(account, eq.total_equity)
+    day_base = account.day_start_equity if account.day_start_equity > 0 else account.initial_capital
+    daily_loss_pct = max(Decimal("0"), (day_base - eq.total_equity) / day_base) if day_base > 0 else Decimal("0")
+    daily_pnl_pct = ((eq.total_equity - day_base) / day_base) * Decimal("100") if day_base > 0 else Decimal("0")
 
     tickers: dict[str, Any] = {}
     for sym in settings.symbols:
@@ -160,6 +165,10 @@ async def get_dashboard(
         },
         "overview": {
             "initial_capital": float(eq.initial_capital),
+            "day_start_equity": float(day_base),
+            "day_start_date": account.day_start_date,
+            "daily_pnl_pct": float(daily_pnl_pct.quantize(Decimal("0.0001"))),
+            "current_daily_loss_pct": float(daily_loss_pct),
             "current_equity": float(eq.total_equity),
             "available_balance": float(eq.available_balance),
             "locked_balance": float(eq.locked_balance),
@@ -178,6 +187,8 @@ async def get_dashboard(
             "max_daily_loss": float(settings.max_daily_loss),
             "max_drawdown": float(settings.max_drawdown),
             "max_open_positions": settings.max_open_positions,
+            "max_single_position_pct": float(settings.max_single_position_pct),
+            "max_same_side_positions": settings.max_same_side_positions,
             "open_positions_count": len(open_pos),
             "emergency_stopped": account.emergency_stopped or survival.emergency_stopped,
         },

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -31,22 +32,30 @@ from app.exchanges.credentials_service import (
     MICRO_LIVE_FUTURES_EXCHANGES,
     min_live_order_usd,
 )
+from app.execution.exit_policy import extract_atr_value, normalize_atr_targets
 from app.execution.order_manager import OrderManager
+from app.execution.protective_orders import (
+    cancel_protective_orders,
+    place_protective_orders,
+    sync_stop_loss_order,
+)
 from app.intelligence.ai_advisor import AIAdvisor
 from app.intelligence.derivatives_intelligence import DerivativesIntelligenceService
 from app.intelligence.openbb_research import OpenBBQuantResearch
 from app.intelligence.opportunity_engine import EvaluatedOpportunity
 from app.intelligence.regime_detector import MarketRegimeDetector
+from app.intelligence.strategy_validation_service import evaluate_separated_oos_stats
 from app.market.candle_manager import CandleManager
 from app.market.market_cache import MarketCache
 from app.portfolio.balance_manager import BalanceManager
+from app.risk.daily_baseline import sync_utc_day_baseline
 from app.risk.position_sizer import effective_isolated_leverage
 from app.risk.survival_controller import SurvivalController, SurvivalState
 from app.security.audit_logger import AuditLogger
 from app.security.authorization import Role
 from app.strategies.base_strategy import StrategySignal
 from app.strategies.strategy_registry import StrategyRegistry
-from app.workers.trading_worker import AutonomousTradingLoop, clamp_quick_targets
+from app.workers.trading_worker import AutonomousTradingLoop
 
 router = APIRouter(tags=["trading"])
 
@@ -355,7 +364,7 @@ async def _execute_controlled_futures_trade(
         survival.state = SurvivalState.NORMAL
 
         if avail < Decimal("1.00"):
-            target_seed = Decimal("100.00")
+            target_seed = Decimal("500.00")
             credited_usdt = target_seed - avail
             avail = target_seed
             await repo.upsert_balance(
@@ -365,6 +374,8 @@ async def _execute_controlled_futures_trade(
                 locked=locked,
             )
             account.initial_capital = avail + locked
+            account.day_start_equity = avail + locked
+            account.day_start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             account.peak_equity = max(account.peak_equity, avail + locked)
             session.add(
                 PortfolioSnapshot(
@@ -425,12 +436,27 @@ async def _execute_controlled_futures_trade(
                     locked = await bal_mgr.get_quote_locked(account.id, account.quote_currency)
         ex_status = await loop.health_monitor.check(loop.exchange)
         snap = await loop.collector.collect_symbol_data(
-            session, norm_symbol, timeframe=timeframe, limit=200, allow_historical=True
+            session, norm_symbol, timeframe=timeframe, limit=400, allow_historical=True
         )
         regime = loop.regime_detector.detect(snap.candles_df)
         openbb_report = loop.openbb_research.analyze(snap.candles_df)
         tv_report = deriv_svc.compute_tradingview_rating(snap.candles_df)
-        deriv_report = await deriv_svc.fetch_derivatives_sentiment(norm_symbol, snap.candles_df)
+        if (
+            type(loop.exchange).__name__ == "MockExchange"
+            and type(deriv_svc).fetch_derivatives_sentiment
+            is DerivativesIntelligenceService.fetch_derivatives_sentiment
+        ):
+            from app.intelligence.derivatives_intelligence import DerivativesSentimentReport
+
+            deriv_report = DerivativesSentimentReport(
+                symbol=norm_symbol,
+                source="MockOffline",
+                allow_long=True,
+                allow_short=True,
+                rationale="MockExchange offline neutral sentiment.",
+            )
+        else:
+            deriv_report = await deriv_svc.fetch_derivatives_sentiment(norm_symbol, snap.candles_df)
 
         is_futures = True
         forced_action = None
@@ -442,7 +468,7 @@ async def _execute_controlled_futures_trade(
             for strat in loop.selector.select_for_regime(regime):
                 sig = strat.generate_signal(norm_symbol, snap.candles_df)
                 if sig.action in {"BUY", "SELL"}:
-                    chosen_signal = clamp_quick_targets(sig, loop.settings)
+                    chosen_signal = normalize_atr_targets(sig, loop.settings, df=snap.candles_df)
                     break
 
         signal_source = "strategy_engine"
@@ -450,15 +476,20 @@ async def _execute_controlled_futures_trade(
             signal_source = "manual_operator" if forced_action else "paper_test_synthetic"
             entry_px = snap.ticker.last
             action = forced_action or ("SELL" if tv_report.rating_score < -0.15 else "BUY")
-            sl_d = loop.settings.quick_stop_loss_pct
-            tp_d = loop.settings.quick_take_profit_pct
+            atr_d = extract_atr_value(snap.candles_df)
+            sl_d = (
+                max(loop.settings.min_stop_loss_pct, min(loop.settings.max_stop_loss_pct, (atr_d / entry_px) * Decimal("1.5")))
+                if atr_d > 0 and entry_px > 0
+                else loop.settings.quick_stop_loss_pct
+            )
+            tp_d = max(loop.settings.quick_take_profit_pct, sl_d * loop.settings.min_reward_risk_ratio)
             if action == "SELL":
                 sl_px = entry_px * (Decimal("1") + sl_d)
                 tp_px = entry_px * (Decimal("1") - tp_d)
             else:
                 sl_px = entry_px * (Decimal("1") - sl_d)
                 tp_px = entry_px * (Decimal("1") + tp_d)
-            chosen_signal = StrategySignal(
+            raw_sig = StrategySignal(
                 strategy="trend_following",
                 symbol=norm_symbol,
                 action=action,
@@ -473,6 +504,7 @@ async def _execute_controlled_futures_trade(
                     "funding_rate": deriv_report.funding_rate,
                 },
             )
+            chosen_signal = normalize_atr_targets(raw_sig, loop.settings, df=snap.candles_df)
 
         sig_row = TradeSignal(
             strategy_name=chosen_signal.strategy,
@@ -495,14 +527,51 @@ async def _execute_controlled_futures_trade(
         session.add(sig_row)
         await session.flush()
 
-        prob = loop.confidence_est.estimate(wins=24, losses=10, oos_wins=9, oos_losses=3)
-        ev = loop.opp_engine.calculate_expected_value(
-            signal=chosen_signal,
-            prob=prob,
-            rules=snap.rules,
-            ticker=snap.ticker,
-            estimated_slippage_bps=snap.liquidity.estimated_slippage_bps,
-        )
+        strat_obj = loop.registry.get(chosen_signal.strategy)
+        live_stats = await repo.get_strategy_regime_realized_stats(account.id)
+        if strat_obj is not None:
+            symbol_frames = [(norm_symbol, snap.candles_df)]
+            for peer_sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"):
+                if peer_sym == norm_symbol or len(symbol_frames) >= 4:
+                    continue
+                with suppress(Exception):
+                    peer_raw = await loop.exchange.fetch_ohlcv(peer_sym, timeframe, limit=400)
+                    if peer_raw and len(peer_raw) >= 120:
+                        symbol_frames.append((peer_sym, CandleManager.to_dataframe(peer_raw)))
+            val_stats = await asyncio.to_thread(
+                evaluate_separated_oos_stats,
+                strategy=strat_obj,
+                regime_name=regime.primary_regime.value,
+                symbol_frames=symbol_frames,
+                live_regime_stats=live_stats,
+                settings=loop.settings,
+            )
+            prob = loop.confidence_est.estimate(
+                wins=val_stats.wins,
+                losses=val_stats.losses,
+                oos_wins=val_stats.oos_wins,
+                oos_losses=val_stats.oos_losses,
+            )
+            ev = loop.opp_engine.calculate_expected_value(
+                signal=chosen_signal,
+                prob=prob,
+                rules=snap.rules,
+                ticker=snap.ticker,
+                estimated_slippage_bps=snap.liquidity.estimated_slippage_bps,
+                avg_win_override=Decimal(str(val_stats.avg_win_pct)),
+                avg_loss_override=Decimal(str(val_stats.avg_loss_pct)),
+            )
+        else:
+            val_stats = None
+            prob = loop.confidence_est.estimate(wins=0, losses=0, oos_wins=0, oos_losses=0)
+            ev = loop.opp_engine.calculate_expected_value(
+                signal=chosen_signal,
+                prob=prob,
+                rules=snap.rules,
+                ticker=snap.ticker,
+                estimated_slippage_bps=snap.liquidity.estimated_slippage_bps,
+            )
+
         opp = EvaluatedOpportunity(
             signal=chosen_signal,
             regime=regime,
@@ -516,11 +585,13 @@ async def _execute_controlled_futures_trade(
         current_open_notional = sum((p.quantity * p.current_price for p in open_positions), Decimal("0"))
         equity_est = avail + locked + current_open_notional
         account.peak_equity = max(account.peak_equity, equity_est)
-        eff_rules = (
-            snap.rules.for_paper_micro_trading()
-            if trading_mode in {TradingMode.PAPER, TradingMode.BACKTEST}
-            else snap.rules
+        sync_utc_day_baseline(account, equity_est)
+
+        use_micro_relax = (
+            not loop.settings.paper_enforce_real_exchange_rules
+            and trading_mode in {TradingMode.PAPER, TradingMode.BACKTEST}
         )
+        eff_rules = snap.rules.for_paper_micro_trading() if use_micro_relax else snap.rules
         pos_lev = effective_isolated_leverage(
             account.leverage, avail, eff_rules, reference_price=snap.ticker.last
         )
@@ -529,7 +600,7 @@ async def _execute_controlled_futures_trade(
             opportunity=opp,
             account_equity=equity_est,
             peak_equity=account.peak_equity,
-            day_start_equity=account.initial_capital,
+            day_start_equity=account.day_start_equity,
             available_balance=avail,
             open_positions_count=len(open_positions),
             current_open_notional=current_open_notional,
@@ -538,8 +609,10 @@ async def _execute_controlled_futures_trade(
             exchange_healthy=ex_status.is_healthy and not ex_status.circuit_open,
             market_data_valid=snap.is_tradeable,
             balance_verified=True,
+            strategy_deteriorated=bool(val_stats and val_stats.auto_disabled),
             market_type=account.market_type,
             leverage=pos_lev,
+            open_positions=open_positions,
         )
 
         decision_rec = AIAdvisor.build_decision_record(
@@ -609,6 +682,24 @@ async def _execute_controlled_futures_trade(
                     if is_futures
                     else Decimal("0")
                 )
+                stop_dist_pct = Decimal(
+                    str(
+                        (chosen_signal.indicators or {}).get("initial_stop_distance_pct")
+                        or (abs(outcome.result.average_price - chosen_signal.stop_loss) / outcome.result.average_price)
+                    )
+                )
+                atr_entry = Decimal(str((chosen_signal.indicators or {}).get("atr") or 0)) or None
+                sl_oid, tp_oid, prot_warnings = await place_protective_orders(
+                    loop.exchange,
+                    symbol=norm_symbol,
+                    position_side=pos_side,
+                    quantity=outcome.result.filled_quantity,
+                    stop_loss=chosen_signal.stop_loss,
+                    take_profit=chosen_signal.take_profit,
+                    rules=eff_rules,
+                    trading_mode=trading_mode,
+                    market_type=account.market_type,
+                )
                 pos = await loop.portfolio_manager.open_position(
                     session,
                     account_id=account.id,
@@ -624,6 +715,11 @@ async def _execute_controlled_futures_trade(
                     market_type=account.market_type,
                     leverage=pos_lev,
                     margin_used=margin_used,
+                    initial_stop_distance_pct=stop_dist_pct,
+                    atr_at_entry=atr_entry,
+                    sl_order_id=sl_oid,
+                    tp_order_id=tp_oid,
+                    market_regime=regime.primary_regime.value,
                 )
                 trade_summary = {
                     "executed": True,
@@ -631,6 +727,9 @@ async def _execute_controlled_futures_trade(
                     "position_id": str(pos.id),
                     "order_id": str(outcome.order.id) if outcome.order else None,
                     "client_order_id": outcome.order.client_order_id if outcome.order else None,
+                    "sl_order_id": sl_oid,
+                    "tp_order_id": tp_oid,
+                    "protective_warnings": prot_warnings,
                     "symbol": norm_symbol,
                     "side": pos_side,
                     "order_side": entry_side,
@@ -991,6 +1090,12 @@ async def get_active_trades_detailed(
                 "distance_to_liq_pct": round(dist_to_liq_pct, 2),
                 "stop_loss": sl_px,
                 "take_profit": tp_px,
+                "sl_order_id": pos.sl_order_id,
+                "tp_order_id": pos.tp_order_id,
+                "exchange_protected": bool(pos.sl_order_id or pos.tp_order_id),
+                "scaled_out": bool(pos.scaled_out),
+                "exit_reason": pos.exit_reason,
+                "market_regime": pos.market_regime,
                 "distance_to_sl_pct": round(dist_to_sl_pct, 2) if dist_to_sl_pct is not None else None,
                 "distance_to_tp_pct": round(dist_to_tp_pct, 2) if dist_to_tp_pct is not None else None,
                 "expected_tp_profit_usd": round(expected_tp_profit_usd, 4) if expected_tp_profit_usd is not None else None,
@@ -1060,6 +1165,13 @@ async def get_active_trades_detailed(
             "total_unrealized_pnl_usd": float(total_unrealized_pnl),
             "total_roi_pct": round(total_roi_pct, 2),
             "max_hold_minutes": settings.max_hold_minutes,
+            "mean_reversion_max_hold_minutes": settings.mean_reversion_max_hold_minutes,
+            "min_stop_loss_pct": float(settings.min_stop_loss_pct) * 100,
+            "max_stop_loss_pct": float(settings.max_stop_loss_pct) * 100,
+            "min_reward_risk_ratio": float(settings.min_reward_risk_ratio),
+            "scale_out_r_multiple": float(settings.scale_out_r_multiple),
+            "scale_out_fraction": float(settings.scale_out_fraction) * 100,
+            "atr_trail_multiplier": float(settings.atr_trail_multiplier),
             "fast_book_profit_pct": float(settings.fast_book_profit_pct) * 100,
         },
         "active_trades": active_list,
@@ -1071,6 +1183,9 @@ async def get_active_trades_detailed(
                 "market_type": c.market_type,
                 "leverage": c.leverage,
                 "strategy_name": c.strategy_name,
+                "market_regime": c.market_regime,
+                "exit_reason": c.exit_reason or "CLOSED",
+                "net_pnl_pct": float(c.net_pnl_pct) * 100 if c.net_pnl_pct is not None else None,
                 "quantity": float(c.quantity),
                 "entry_price": float(c.entry_price),
                 "exit_price": float(c.current_price),
@@ -1137,6 +1252,7 @@ async def close_active_position(
                 actual_frac = part_qty / pos.quantity
                 part_margin = (pos.margin_used * actual_frac).quantize(Decimal("0.00000001"))
                 part_fee = (pos.entry_fee * actual_frac).quantize(Decimal("0.00000001"))
+                remaining_pos = pos
                 part = Position(
                     account_id=pos.account_id,
                     symbol=pos.symbol,
@@ -1152,6 +1268,10 @@ async def close_active_position(
                     current_price=pos.current_price,
                     stop_loss=pos.stop_loss,
                     take_profit=pos.take_profit,
+                    initial_stop_distance_pct=pos.initial_stop_distance_pct,
+                    atr_at_entry=pos.atr_at_entry,
+                    scaled_out=pos.scaled_out,
+                    market_regime=pos.market_regime,
                     entry_fee=part_fee,
                     unrealized_pnl=Decimal("0"),
                     realized_pnl=Decimal("0"),
@@ -1166,6 +1286,7 @@ async def close_active_position(
                 pos = part
                 frac = actual_frac
         else:
+            remaining_pos = None
             remaining_id = None
 
         exit_side = "BUY" if pos.side.upper() == "SHORT" else "SELL"
@@ -1201,11 +1322,23 @@ async def close_active_position(
 
         exit_px = outcome.result.average_price
         exit_fee = outcome.result.fee
+        exit_lbl = "MANUAL_PARTIAL_BOOK" if remaining_id is not None else "MANUAL_CLOSE"
+        if remaining_id is None:
+            await cancel_protective_orders(loop.exchange, pos, pos_mode)
+        elif remaining_pos is not None and remaining_pos.stop_loss is not None:
+            await sync_stop_loss_order(
+                loop.exchange,
+                remaining_pos,
+                remaining_pos.stop_loss,
+                rules=eff_rules,
+                trading_mode=pos_mode,
+            )
         realized = await loop.portfolio_manager.close_position(
             session,
             position=pos,
             exit_price=exit_px,
             exit_fee=exit_fee,
+            exit_reason=exit_lbl,
         )
         await loop.portfolio_manager.mark_to_market(
             session,
@@ -1439,8 +1572,11 @@ async def update_position_tpsl(
     body: UpdateTpSlBody,
     user: Annotated[User, Depends(require_role(Role.OPERATOR))],
     session: Annotated[AsyncSession, Depends(get_db_session)],
+    survival: Annotated[SurvivalController, Depends(get_survival_controller)],
+    registry: Annotated[StrategyRegistry, Depends(get_strategy_registry)],
+    cache: Annotated[MarketCache, Depends(get_market_cache)],
 ) -> dict[str, Any]:
-    """Update Stop Loss and Take Profit levels on an active open position."""
+    """Update Stop Loss and Take Profit levels on an active open position and sync exchange triggers."""
     try:
         pos_uuid = uuid.UUID(position_id)
     except ValueError as exc:
@@ -1458,6 +1594,30 @@ async def update_position_tpsl(
     if body.take_profit is not None:
         pos.take_profit = Decimal(str(body.take_profit)) if body.take_profit > 0 else None
 
+    pos_mode = TradingMode(pos.trading_mode) if pos.trading_mode else TradingMode(account.trading_mode)
+    if pos_mode in {TradingMode.LIVE_TRADING, TradingMode.TESTNET} and pos.market_type.upper() == "FUTURES":
+        loop = await _build_loop_for_account(
+            session, account, registry=registry, survival=survival, cache=cache
+        )
+        try:
+            rules = await loop.exchange.get_market_rules(pos.symbol)
+            await cancel_protective_orders(loop.exchange, pos, pos_mode)
+            sl_oid, tp_oid, _ = await place_protective_orders(
+                loop.exchange,
+                symbol=pos.symbol,
+                position_side=pos.side,
+                quantity=pos.quantity,
+                stop_loss=pos.stop_loss,
+                take_profit=pos.take_profit,
+                rules=rules,
+                trading_mode=pos_mode,
+                market_type=pos.market_type,
+            )
+            pos.sl_order_id = sl_oid
+            pos.tp_order_id = tp_oid
+        finally:
+            await loop.exchange.close()
+
     await session.flush()
     await AuditLogger.log(
         session,
@@ -1469,6 +1629,8 @@ async def update_position_tpsl(
             "symbol": pos.symbol,
             "stop_loss": float(pos.stop_loss) if pos.stop_loss else None,
             "take_profit": float(pos.take_profit) if pos.take_profit else None,
+            "sl_order_id": pos.sl_order_id,
+            "tp_order_id": pos.tp_order_id,
         },
     )
     return {
@@ -1476,4 +1638,6 @@ async def update_position_tpsl(
         "position_id": str(pos.id),
         "stop_loss": float(pos.stop_loss) if pos.stop_loss else None,
         "take_profit": float(pos.take_profit) if pos.take_profit else None,
+        "sl_order_id": pos.sl_order_id,
+        "tp_order_id": pos.tp_order_id,
     }

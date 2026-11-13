@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adaptive.drift_detector import DriftDetector
 from app.adaptive.strategy_selector import StrategySelector
-from app.backtesting.backtest_engine import BacktestEngine
 from app.backtesting.performance_metrics import TradeRecord
 from app.config import Settings, TradingMode, get_settings
-from app.database.models import Account, RiskDecision, TradeSignal
+from app.database.models import Account, Position, RiskDecision, TradeSignal
 from app.database.repositories.trading_repo import TradingRepository
 from app.database.session import get_db_manager
 from app.exchanges.base_exchange import BaseExchange, OrderRequest
@@ -22,13 +21,31 @@ from app.exchanges.credentials_service import ExchangeConnectionService
 from app.exchanges.exchange_factory import ExchangeFactory
 from app.exchanges.exchange_health import ExchangeHealthMonitor
 from app.execution.execution_engine import ExecutionEngine
+from app.execution.exit_policy import (
+    clamp_quick_targets,
+    evaluate_position_exit_step,
+    extract_atr_value,
+    normalize_atr_targets,
+)
 from app.execution.order_manager import OrderManager
+from app.execution.protective_orders import (
+    cancel_protective_orders,
+    detect_triggered_protective_fill,
+    place_protective_orders,
+    sync_stop_loss_order,
+)
 from app.execution.reconciliation import ReconciliationService
 from app.intelligence.ai_advisor import AIAdvisor
 from app.intelligence.confidence_estimator import ConfidenceEstimator
+from app.intelligence.derivatives_intelligence import DerivativesIntelligenceService
 from app.intelligence.openbb_research import OpenBBQuantResearch
 from app.intelligence.opportunity_engine import EvaluatedOpportunity, OpportunityEngine
 from app.intelligence.regime_detector import MarketRegime, MarketRegimeDetector
+from app.intelligence.strategy_validation_service import (
+    StrategyValidationStats,
+    check_phase2_entry_filters,
+    evaluate_separated_oos_stats,
+)
 from app.market.data_collector import MarketDataCollector
 from app.market.market_cache import MarketCache
 from app.market.universe_discovery import (
@@ -37,36 +54,14 @@ from app.market.universe_discovery import (
 )
 from app.portfolio.balance_manager import BalanceManager
 from app.portfolio.portfolio_manager import PortfolioManager
+from app.risk.daily_baseline import sync_utc_day_baseline
 from app.risk.position_sizer import effective_isolated_leverage
 from app.risk.risk_manager import RiskManager
 from app.risk.survival_controller import SurvivalController
 from app.strategies.strategy_registry import StrategyRegistry
 
 
-def clamp_quick_targets(sig: Any, settings: Settings) -> Any:
-    """Tighten SL/TP to a short-horizon scalp profile (book profit fast, within ~1 hour)."""
-    from dataclasses import replace as dc_replace
-
-    if sig.action not in {"BUY", "SELL"} or not sig.entry_price or sig.entry_price <= 0:
-        return sig
-    e = sig.entry_price
-    tp_d = settings.quick_take_profit_pct
-    sl_d = settings.quick_stop_loss_pct
-    if sig.action == "BUY":
-        min_sl = e * (Decimal("1") - sl_d)
-        sl = max(sig.stop_loss, min_sl) if sig.stop_loss and sig.stop_loss < e else min_sl
-        sl_dist = e - sl
-        max_tp = e * (Decimal("1") + tp_d)
-        floor_tp = min(max_tp, e + max(sl_dist * Decimal("2.0"), e * Decimal("0.012")))
-        tp = max(floor_tp, min(sig.take_profit, max_tp)) if sig.take_profit and sig.take_profit > e else max_tp
-    else:
-        max_sl = e * (Decimal("1") + sl_d)
-        sl = min(sig.stop_loss, max_sl) if sig.stop_loss and sig.stop_loss > e else max_sl
-        sl_dist = sl - e
-        min_tp = e * (Decimal("1") - tp_d)
-        floor_tp = max(min_tp, e - max(sl_dist * Decimal("2.0"), e * Decimal("0.012")))
-        tp = min(floor_tp, max(sig.take_profit, min_tp)) if sig.take_profit and sig.take_profit < e else min_tp
-    return dc_replace(sig, take_profit=tp, stop_loss=sl)
+_CLAMP_COMPAT = clamp_quick_targets
 
 
 class AutonomousTradingLoop:
@@ -110,6 +105,7 @@ class AutonomousTradingLoop:
         self.reconciliation = ReconciliationService()
         self.portfolio_manager = PortfolioManager(self.settings)
         self.drift_detector = DriftDetector()
+        self.deriv_svc = DerivativesIntelligenceService()
 
     @staticmethod
     def _is_live_authorized(account: Account) -> bool:
@@ -210,7 +206,7 @@ class AutonomousTradingLoop:
                         bundle = await self.collector.fetch_raw_bundle(
                             sym,
                             timeframe=tf,
-                            limit=260,
+                            limit=420 if tf == timeframe else 260,
                             cached_ticker=global_tickers.get(sym),
                             skip_order_book=bool(global_tickers) and (sym not in open_set),
                         )
@@ -262,72 +258,198 @@ class AutonomousTradingLoop:
 
         snaps = await _fetch_charts(symbols_to_collect, timeframe)
 
-        # STEP 17: Monitor all open positions first (SL / TP / trailing peak profit lock / 60-min hard time cap)
+        # STEP 17: Monitor all open positions with unified ATR scale-out + 1.2x ATR trail + exchange triggers
         now_utc = datetime.now(timezone.utc)
         for pos in open_positions:
+            pos_mode = TradingMode(pos.trading_mode) if pos.trading_mode else trading_mode
+            trig_fill = await detect_triggered_protective_fill(self.exchange, pos, pos_mode)
+            if trig_fill is not None:
+                trig_reason, trig_px = trig_fill
+                await cancel_protective_orders(self.exchange, pos, pos_mode)
+                realized = await self.portfolio_manager.close_position(
+                    session,
+                    position=pos,
+                    exit_price=trig_px,
+                    exit_fee=(pos.quantity * trig_px) * Decimal("0.001"),
+                    exit_reason=trig_reason,
+                )
+                avail_quote = await bal_mgr.get_quote_available(account.id, account.quote_currency)
+                await repo.log_agent_event(
+                    event_type="POSITION_EXIT",
+                    component="trading_worker",
+                    severity="INFO",
+                    message=(
+                        f"Exchange trigger filled {pos.side} {pos.symbol} via {trig_reason} @ ${float(trig_px):.4f} "
+                        f"(realized PnL: ${float(realized):+.2f})"
+                    ),
+                    payload={"symbol": pos.symbol, "side": pos.side, "exit_reason": trig_reason, "realized_pnl": float(realized)},
+                )
+                continue
+
             snap = snaps.get(pos.symbol)
             if snap is None:
                 continue
             is_short = pos.side.upper() == "SHORT"
             exit_px_ref = snap.ticker.ask if is_short else snap.ticker.bid
-            if is_short:
-                hit_sl = pos.stop_loss is not None and snap.ticker.ask >= pos.stop_loss
-                hit_tp = pos.take_profit is not None and snap.ticker.ask <= pos.take_profit
-                exit_side = "BUY"
-                move_pct = (pos.entry_price - exit_px_ref) / pos.entry_price if pos.entry_price > 0 else Decimal("0")
-            else:
-                hit_sl = pos.stop_loss is not None and snap.ticker.bid <= pos.stop_loss
-                hit_tp = pos.take_profit is not None and snap.ticker.bid >= pos.take_profit
-                exit_side = "SELL"
-                move_pct = (exit_px_ref - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else Decimal("0")
+            exit_side = "BUY" if is_short else "SELL"
 
-            # Track peak favorable move to capture runners cleanly instead of capping gains prematurely
-            peak_key = f"pos:peak:{pos.id}"
+            # Track favorable extreme price since entry for 1.2x ATR trailing
+            peak_key = f"pos:peak_px:{pos.id}"
             cached_peak = await self.cache.get_json(peak_key)
-            prev_peak = Decimal(str(cached_peak["peak_move_pct"])) if cached_peak else move_pct
-            peak_move = max(prev_peak, move_pct)
-            await self.cache.set_json(peak_key, {"peak_move_pct": str(peak_move)}, ttl_seconds=7200)
+            cand_hi = Decimal(str(float(snap.candles_df["high"].iloc[-1]))) if len(snap.candles_df) > 0 else exit_px_ref
+            cand_lo = Decimal(str(float(snap.candles_df["low"].iloc[-1]))) if len(snap.candles_df) > 0 else exit_px_ref
+            curr_extreme = min(exit_px_ref, cand_lo) if is_short else max(exit_px_ref, cand_hi)
+            prev_peak_px = Decimal(str(cached_peak["peak_price"])) if cached_peak and cached_peak.get("peak_price") else pos.entry_price
+            peak_price = min(prev_peak_px, curr_extreme) if is_short else max(prev_peak_px, curr_extreme)
+            await self.cache.set_json(peak_key, {"peak_price": str(peak_price)}, ttl_seconds=14400)
 
             opened = pos.opened_at if pos.opened_at.tzinfo else pos.opened_at.replace(tzinfo=timezone.utc)
             held_min = (now_utc - opened).total_seconds() / 60.0
-            hit_time = held_min >= self.settings.max_hold_minutes
-
-            # Arm breakeven+fee trailing profit lock once move crosses fast_book_profit_pct (+0.45%)
-            trail_armed = peak_move >= self.settings.fast_book_profit_pct
-            if trail_armed and pos.entry_price > 0:
-                lock_floor_px = (
-                    pos.entry_price * Decimal("0.9975")
-                    if is_short
-                    else pos.entry_price * Decimal("1.0025")
-                )
-                if is_short:
-                    if pos.stop_loss is None or pos.stop_loss > lock_floor_px:
-                        pos.stop_loss = lock_floor_px
-                else:
-                    if pos.stop_loss is None or pos.stop_loss < lock_floor_px:
-                        pos.stop_loss = lock_floor_px
-
-            trail_gap = Decimal("0.0025") if peak_move >= Decimal("0.010") else Decimal("0.0018")
-            hit_trailing_lock = (
-                trail_armed
-                and move_pct <= (peak_move - trail_gap)
-                and move_pct >= Decimal("0.0024")
+            live_atr = extract_atr_value(snap.candles_df) or pos.atr_at_entry or Decimal("0")
+            use_micro_exit = (
+                not self.settings.paper_enforce_real_exchange_rules
+                and pos_mode in {TradingMode.PAPER, TradingMode.BACKTEST}
+                and not self._custom_exchange
             )
-            hit_late_fast_book = trail_armed and held_min >= max(35.0, self.settings.max_hold_minutes * 0.65)
-            # After 30 min, take any fee-covering profit instead of stalling
-            hit_soft_time = held_min >= self.settings.max_hold_minutes / 2 and move_pct >= Decimal("0.0018")
-            if hit_sl or hit_tp or hit_time or hit_trailing_lock or hit_late_fast_book or hit_soft_time:
-                exit_reason = (
-                    "TAKE_PROFIT"
-                    if hit_tp
-                    else "TRAILING_PROFIT_LOCK"
-                    if (hit_trailing_lock or hit_late_fast_book)
-                    else "SOFT_TIME_PROFIT"
-                    if hit_soft_time
-                    else "TIME_CAP_60M"
-                    if hit_time
-                    else "STOP_LOSS"
-                )
+            exit_rules = snap.rules.for_paper_micro_trading() if use_micro_exit else snap.rules
+
+            decision = evaluate_position_exit_step(
+                side=pos.side,
+                strategy_name=pos.strategy_name,
+                entry_price=pos.entry_price,
+                current_price=exit_px_ref,
+                stop_loss=pos.stop_loss,
+                take_profit=pos.take_profit,
+                initial_stop_distance_pct=pos.initial_stop_distance_pct,
+                atr_value=live_atr,
+                peak_price=peak_price,
+                scaled_out=bool(pos.scaled_out),
+                held_minutes=held_min,
+                settings=self.settings,
+            )
+
+            # Update ratcheted breakeven/trail stop loss in DB and on exchange STOP_MARKET
+            if decision.new_stop_loss is not None and decision.new_stop_loss != pos.stop_loss:
+                pos.stop_loss = decision.new_stop_loss
+                if decision.close_fraction < 1.0:
+                    await sync_stop_loss_order(
+                        self.exchange,
+                        pos,
+                        decision.new_stop_loss,
+                        rules=exit_rules,
+                        trading_mode=pos_mode,
+                    )
+
+            # Partial scale-out at 1.0R (book 50% and move stop to breakeven+fee)
+            if 0.0 < decision.close_fraction < 1.0:
+                prec = max(0, int(getattr(exit_rules, "quantity_precision", 6)))
+                step = Decimal("10") ** (-prec)
+                part_qty = (pos.quantity * Decimal(str(decision.close_fraction))).quantize(step, rounding=ROUND_DOWN)
+                rem_qty = pos.quantity - part_qty
+                if part_qty > Decimal("0") and rem_qty > Decimal("0"):
+                    actual_frac = part_qty / pos.quantity
+                    part_margin = (pos.margin_used * actual_frac).quantize(Decimal("0.00000001"))
+                    part_fee = (pos.entry_fee * actual_frac).quantize(Decimal("0.00000001"))
+                    part_pos = Position(
+                        account_id=pos.account_id,
+                        symbol=pos.symbol,
+                        strategy_name=pos.strategy_name,
+                        trading_mode=pos.trading_mode,
+                        market_type=pos.market_type,
+                        leverage=pos.leverage,
+                        margin_used=part_margin,
+                        status="OPEN",
+                        side=pos.side,
+                        quantity=part_qty,
+                        entry_price=pos.entry_price,
+                        current_price=pos.current_price,
+                        stop_loss=pos.stop_loss,
+                        take_profit=pos.take_profit,
+                        initial_stop_distance_pct=pos.initial_stop_distance_pct,
+                        atr_at_entry=pos.atr_at_entry,
+                        scaled_out=True,
+                        market_regime=pos.market_regime,
+                        entry_fee=part_fee,
+                        unrealized_pnl=Decimal("0"),
+                        realized_pnl=Decimal("0"),
+                        opened_at=pos.opened_at,
+                    )
+                    pos.quantity = rem_qty
+                    pos.margin_used = max(Decimal("0"), pos.margin_used - part_margin)
+                    pos.entry_fee = max(Decimal("0"), pos.entry_fee - part_fee)
+                    pos.scaled_out = True
+                    session.add(part_pos)
+                    await session.flush()
+
+                    part_req = OrderRequest(
+                        symbol=pos.symbol,
+                        side=exit_side,
+                        order_type="MARKET",
+                        quantity=part_qty,
+                        client_order_id=OrderManager.build_client_order_id("scale1r"),
+                        reduce_only=pos.market_type.upper() == "FUTURES",
+                    )
+                    part_outcome = await self.execution_engine.execute(
+                        session=session,
+                        account_id=account.id,
+                        risk_decision_id=None,
+                        request=part_req,
+                        rules=exit_rules,
+                        ticker=snap.ticker,
+                        order_book=None,
+                        trading_mode=pos_mode,
+                        live_authorized=(pos_mode == TradingMode.LIVE_TRADING and self._is_live_authorized(account)),
+                        strategy_name=pos.strategy_name,
+                        market_regime="SCALE_OUT_1R",
+                        market_type=pos.market_type,
+                        leverage=pos.leverage,
+                        closing_position=part_pos,
+                    )
+                    if part_outcome.executed and part_outcome.result and part_outcome.result.average_price:
+                        realized_part = await self.portfolio_manager.close_position(
+                            session,
+                            position=part_pos,
+                            exit_price=part_outcome.result.average_price,
+                            exit_fee=part_outcome.result.fee,
+                            exit_reason="SCALE_OUT_1R",
+                        )
+                        if pos.stop_loss is not None:
+                            await sync_stop_loss_order(
+                                self.exchange,
+                                pos,
+                                pos.stop_loss,
+                                rules=exit_rules,
+                                trading_mode=pos_mode,
+                            )
+                        avail_quote = await bal_mgr.get_quote_available(account.id, account.quote_currency)
+                        await repo.log_agent_event(
+                            event_type="POSITION_SCALE_OUT_1R",
+                            component="trading_worker",
+                            severity="INFO",
+                            message=(
+                                f"Scaled out {float(actual_frac)*100:.0f}% of {pos.side} {pos.symbol} @ "
+                                f"${float(part_outcome.result.average_price):.4f} (PnL ${float(realized_part):+.2f}); "
+                                f"SL raised to ${float(pos.stop_loss or 0):.4f}"
+                            ),
+                            payload={
+                                "symbol": pos.symbol,
+                                "exit_reason": "SCALE_OUT_1R",
+                                "realized_pnl": float(realized_part),
+                                "new_stop_loss": float(pos.stop_loss or 0),
+                            },
+                        )
+                    else:
+                        # Roll back split quantities if partial reduce-only rejected
+                        pos.quantity = pos.quantity + part_qty
+                        pos.margin_used = pos.margin_used + part_margin
+                        pos.entry_fee = pos.entry_fee + part_fee
+                        part_pos.status = "CANCELED"
+                else:
+                    pos.scaled_out = True
+                continue
+
+            if decision.close_fraction >= 1.0:
+                exit_reason = decision.exit_reason or "EXIT"
                 exit_req = OrderRequest(
                     symbol=pos.symbol,
                     side=exit_side,
@@ -335,12 +457,6 @@ class AutonomousTradingLoop:
                     quantity=pos.quantity,
                     client_order_id=OrderManager.build_client_order_id("exit"),
                     reduce_only=pos.market_type.upper() == "FUTURES",
-                )
-                pos_mode = TradingMode(pos.trading_mode) if pos.trading_mode else trading_mode
-                exit_rules = (
-                    snap.rules.for_paper_micro_trading()
-                    if (pos_mode in {TradingMode.PAPER, TradingMode.BACKTEST} and not self._custom_exchange)
-                    else snap.rules
                 )
                 outcome = await self.execution_engine.execute(
                     session=session,
@@ -359,11 +475,13 @@ class AutonomousTradingLoop:
                     closing_position=pos,
                 )
                 if outcome.executed and outcome.result and outcome.result.average_price:
+                    await cancel_protective_orders(self.exchange, pos, pos_mode)
                     realized = await self.portfolio_manager.close_position(
                         session,
                         position=pos,
                         exit_price=outcome.result.average_price,
                         exit_fee=outcome.result.fee,
+                        exit_reason=exit_reason,
                     )
                     avail_quote = await bal_mgr.get_quote_available(account.id, account.quote_currency)
                     await repo.log_agent_event(
@@ -389,13 +507,49 @@ class AutonomousTradingLoop:
         open_symbols = {p.symbol for p in open_positions}
         current_open_notional = sum((p.quantity * p.current_price for p in open_positions), Decimal("0"))
 
-        # STEP 5-9: Scan ALL discovered coins in the universe & rank the strongest setups
+        # STEP 5-9: Scan ALL discovered coins in the universe & rank setups through Phase 0-2 gates
         recent_trades_cache = await repo.get_recent_trades(account.id, 150)
+        live_regime_stats = await repo.get_strategy_regime_realized_stats(account.id)
         should_scan_entries = (
             (account.is_trading_active or manual_trigger)
             and len(open_positions) < self.settings.max_open_positions
             and not account.emergency_stopped
         )
+
+        # Resolve BTC market regime context once per cycle for altcoin correlation filtering
+        btc_regime: MarketRegime | None = None
+        btc_bearish_slope = False
+        btc_bullish_slope = False
+        btc_snap = snaps.get("BTC/USDT")
+        if btc_snap is not None and len(btc_snap.candles_df) >= 55:
+            btc_reg_rep = self.regime_detector.detect(btc_snap.candles_df)
+            btc_regime = btc_reg_rep.primary_regime
+            from app.strategies.base_strategy import Indicators
+
+            b_close = btc_snap.candles_df["close"].astype(float)
+            b_ema20 = float(Indicators.ema(b_close, 20).iloc[-1])
+            b_ema50 = float(Indicators.ema(b_close, 50).iloc[-1])
+            btc_bearish_slope = b_ema20 < b_ema50 * 0.996 and float(b_close.iloc[-1]) < b_ema20
+            btc_bullish_slope = b_ema20 > b_ema50 * 1.004 and float(b_close.iloc[-1]) > b_ema20
+
+        htf_cache: dict[str, Any] = {}
+        cycle_bt_cache: dict[tuple[str, str], tuple[int, int, int, int, list[float], list[float]]] = {}
+
+        async def _get_htf_df(sym: str, fallback_df: Any) -> Any:
+            if sym in htf_cache:
+                return htf_cache[sym]
+            try:
+                raw_1h = await self.exchange.fetch_ohlcv(sym, "1h", limit=100)
+                if raw_1h and len(raw_1h) >= 55:
+                    from app.market.candle_manager import CandleManager
+
+                    df_1h = CandleManager.to_dataframe(raw_1h)
+                    htf_cache[sym] = df_1h
+                    return df_1h
+            except Exception:
+                pass
+            htf_cache[sym] = None
+            return None
 
         async def _evaluate_charts(
             chart_snaps: dict[str, Any], tf: str
@@ -415,9 +569,102 @@ class AutonomousTradingLoop:
                     continue
 
                 best_opp: EvaluatedOpportunity | None = None
+                deriv_report = None
+                htf_df = None
                 for strat in candidates:
-                    sig = clamp_quick_targets(strat.generate_signal(sym, snap.candles_df), self.settings)
+                    raw_sig = strat.generate_signal(sym, snap.candles_df)
+                    sig = normalize_atr_targets(raw_sig, self.settings, df=snap.candles_df)
                     obb_allowed, obb_reason = openbb_report.allows_strategy_entry(strat.name, sig.action)
+
+                    if sig.action not in {"BUY", "SELL"} or not obb_allowed:
+                        val_stats = StrategyValidationStats(
+                            wins=0,
+                            losses=0,
+                            oos_wins=0,
+                            oos_losses=0,
+                            avg_win_pct=float(self.settings.quick_stop_loss_pct) * 1.4,
+                            avg_loss_pct=float(self.settings.quick_stop_loss_pct),
+                            net_expectancy_pct=0.0,
+                            oos_trade_count=0,
+                            live_trade_count=0,
+                            auto_disabled=False,
+                        )
+                    elif strategy_stats_override and strat.name in strategy_stats_override:
+                        w, l, ow, ol = strategy_stats_override[strat.name]
+                        val_stats = StrategyValidationStats(
+                            wins=w,
+                            losses=l,
+                            oos_wins=ow,
+                            oos_losses=ol,
+                            avg_win_pct=float(self.settings.quick_stop_loss_pct) * 1.4,
+                            avg_loss_pct=float(self.settings.quick_stop_loss_pct),
+                            net_expectancy_pct=0.0,
+                            oos_trade_count=ow + ol,
+                            live_trade_count=0,
+                            auto_disabled=False,
+                        )
+                    else:
+                        val_stats = await self._validate_strategy_history(
+                            strat=strat,
+                            primary_symbol=sym,
+                            regime_name=regime.primary_regime.value,
+                            snaps=chart_snaps,
+                            timeframe=tf,
+                            live_regime_stats=live_regime_stats,
+                            per_symbol_cache=cycle_bt_cache,
+                        )
+
+                    if val_stats.auto_disabled:
+                        await repo.log_agent_event(
+                            event_type="STRATEGY_REGIME_DISABLED",
+                            component="trading_worker",
+                            severity="WARNING",
+                            message=val_stats.disable_reason or f"Auto-disabled {strat.name} in {regime.primary_regime.value}",
+                            payload={"strategy": strat.name, "regime": regime.primary_regime.value},
+                        )
+
+                    gate_ok = True
+                    gate_reason = "HOLD"
+                    if sig.action in {"BUY", "SELL"} and obb_allowed and not val_stats.auto_disabled:
+                        if deriv_report is None:
+                            if (
+                                type(self.exchange).__name__ == "MockExchange"
+                                and type(self.deriv_svc).fetch_derivatives_sentiment
+                                is DerivativesIntelligenceService.fetch_derivatives_sentiment
+                            ):
+                                from app.intelligence.derivatives_intelligence import DerivativesSentimentReport
+
+                                deriv_report = DerivativesSentimentReport(
+                                    symbol=sym,
+                                    source="MockOffline",
+                                    allow_long=True,
+                                    allow_short=True,
+                                    rationale="MockExchange offline neutral sentiment.",
+                                )
+                            else:
+                                deriv_report = await self.deriv_svc.fetch_derivatives_sentiment(sym, snap.candles_df)
+                        if htf_df is None and sym not in htf_cache:
+                            htf_df = await _get_htf_df(sym, snap.candles_df)
+                        else:
+                            htf_df = htf_cache.get(sym)
+                        mr_pair = live_regime_stats.get(("mean_reversion", regime.primary_regime.value)) or live_regime_stats.get(("mean_reversion", "ALL"))
+                        mr_exp = float(mr_pair["net_expectancy_pct"]) if mr_pair and int(mr_pair["trade_count"]) >= 10 else 0.0
+                        gate_ok, gate_reason = check_phase2_entry_filters(
+                            symbol=sym,
+                            action=sig.action,
+                            strategy_name=strat.name,
+                            regime=regime.primary_regime,
+                            htf_df=htf_df,
+                            btc_regime=btc_regime,
+                            btc_bearish_slope=btc_bearish_slope,
+                            btc_bullish_slope=btc_bullish_slope,
+                            deriv_report=deriv_report,
+                            mean_reversion_net_expectancy=mr_exp,
+                        )
+                    elif val_stats.auto_disabled:
+                        gate_ok = False
+                        gate_reason = val_stats.disable_reason or "Strategy auto-disabled"
+
                     sig_row = TradeSignal(
                         strategy_name=sig.strategy,
                         symbol=sig.symbol,
@@ -433,53 +680,52 @@ class AutonomousTradingLoop:
                             **(sig.indicators or {}),
                             "openbb_quant": openbb_report.to_dict(),
                             "openbb_filter": obb_reason,
+                            "phase2_gate": {"passed": gate_ok, "reason": gate_reason},
+                            "derivatives_sentiment": deriv_report.to_dict() if deriv_report else None,
+                            "oos_validation": {
+                                "wins": val_stats.wins,
+                                "losses": val_stats.losses,
+                                "oos_wins": val_stats.oos_wins,
+                                "oos_losses": val_stats.oos_losses,
+                                "avg_win_pct": val_stats.avg_win_pct,
+                                "avg_loss_pct": val_stats.avg_loss_pct,
+                                "net_expectancy_pct": val_stats.net_expectancy_pct,
+                                "auto_disabled": val_stats.auto_disabled,
+                            },
                         },
                     )
                     session.add(sig_row)
                     await session.flush()
 
-                    if sig.action == "HOLD" or not obb_allowed:
+                    if sig.action == "HOLD" or not obb_allowed or not gate_ok:
                         continue
 
-                    if strategy_stats_override and strat.name in strategy_stats_override:
-                        w, l, ow, ol = strategy_stats_override[strat.name]
-                    else:
-                        past_trades = [
-                            t
-                            for t in recent_trades_cache
-                            if t.strategy_name == strat.name and t.realized_pnl is not None
-                        ]
-                        w = sum(1 for t in past_trades if (t.realized_pnl or 0) > 0)
-                        l = sum(1 for t in past_trades if (t.realized_pnl or 0) <= 0)
-                        ow, ol = 0, 0
-                        if (w + l) < self.confidence_est.min_sample_size:
-                            bt_w, bt_l, bt_ow, bt_ol = await self._validate_strategy_history(
-                                strat=strat,
-                                primary_symbol=sym,
-                                snaps=chart_snaps,
-                                timeframe=tf,
-                            )
-                            w += bt_w
-                            l += bt_l
-                            ow = max(ow, bt_ow)
-                            ol = max(ol, bt_ol)
-
-                    prob = self.confidence_est.estimate(wins=w, losses=l, oos_wins=ow, oos_losses=ol)
+                    prob = self.confidence_est.estimate(
+                        wins=val_stats.wins,
+                        losses=val_stats.losses,
+                        oos_wins=val_stats.oos_wins,
+                        oos_losses=val_stats.oos_losses,
+                    )
+                    avg_w_ovr = None if strategy_stats_override else Decimal(str(val_stats.avg_win_pct))
+                    avg_l_ovr = None if strategy_stats_override else Decimal(str(val_stats.avg_loss_pct))
                     ev = self.opp_engine.calculate_expected_value(
                         signal=sig,
                         prob=prob,
                         rules=snap.rules,
                         ticker=snap.ticker,
                         estimated_slippage_bps=snap.liquidity.estimated_slippage_bps,
+                        avg_win_override=avg_w_ovr,
+                        avg_loss_override=avg_l_ovr,
                     )
                     compat = self.opp_engine.is_regime_compatible(strat.preferred_regimes, regime)
+                    deriv_boost = deriv_report.confidence_boost if deriv_report else 0.0
                     opp = EvaluatedOpportunity(
                         signal=sig,
                         regime=regime,
                         probability=prob,
                         ev=ev,
                         regime_compatible=compat,
-                        score=float(ev.net_ev_pct) * (1.0 if compat else 0.0),
+                        score=(float(ev.net_ev_pct) + deriv_boost * 0.01) * (1.0 if compat else 0.0),
                     )
                     if best_opp is None or (opp.score, opp.signal.confidence) > (
                         best_opp.score,
@@ -532,11 +778,13 @@ class AutonomousTradingLoop:
 
             locked_quote = await bal_mgr.get_quote_locked(account.id, account.quote_currency)
             equity_est = avail_quote + locked_quote + current_open_notional
-            eff_rules = (
-                snap.rules.for_paper_micro_trading()
-                if (trading_mode in {TradingMode.PAPER, TradingMode.BACKTEST} and not self._custom_exchange)
-                else snap.rules
+            sync_utc_day_baseline(account, equity_est)
+            use_micro_rules = (
+                not self.settings.paper_enforce_real_exchange_rules
+                and trading_mode in {TradingMode.PAPER, TradingMode.BACKTEST}
+                and not self._custom_exchange
             )
+            eff_rules = snap.rules.for_paper_micro_trading() if use_micro_rules else snap.rules
             trade_leverage = effective_isolated_leverage(
                 account.leverage, avail_quote, eff_rules, reference_price=snap.ticker.last
             )
@@ -544,7 +792,7 @@ class AutonomousTradingLoop:
                 opportunity=best_opp,
                 account_equity=equity_est,
                 peak_equity=account.peak_equity,
-                day_start_equity=account.initial_capital,
+                day_start_equity=account.day_start_equity,
                 available_balance=avail_quote,
                 open_positions_count=len(open_positions),
                 current_open_notional=current_open_notional,
@@ -555,6 +803,7 @@ class AutonomousTradingLoop:
                 balance_verified=recon.verified,
                 market_type="FUTURES",
                 leverage=trade_leverage,
+                open_positions=open_positions,
             )
 
             decision_rec = AIAdvisor.build_decision_record(
@@ -621,6 +870,32 @@ class AutonomousTradingLoop:
                     pos_side = "SHORT" if entry_side == "SELL" else "LONG"
                     notional = outcome.result.filled_quantity * outcome.result.average_price
                     margin_used = notional / Decimal(trade_leverage)
+                    stop_dist_pct = Decimal(
+                        str(
+                            (best_opp.signal.indicators or {}).get("initial_stop_distance_pct")
+                            or (abs(outcome.result.average_price - best_opp.signal.stop_loss) / outcome.result.average_price)
+                        )
+                    )
+                    atr_entry = Decimal(str((best_opp.signal.indicators or {}).get("atr") or 0)) or None
+                    sl_oid, tp_oid, prot_warnings = await place_protective_orders(
+                        self.exchange,
+                        symbol=symbol,
+                        position_side=pos_side,
+                        quantity=outcome.result.filled_quantity,
+                        stop_loss=best_opp.signal.stop_loss,
+                        take_profit=best_opp.signal.take_profit,
+                        rules=eff_rules,
+                        trading_mode=trading_mode,
+                        market_type="FUTURES",
+                    )
+                    if prot_warnings:
+                        await repo.log_agent_event(
+                            event_type="EXCHANGE_PROTECTIVE_ORDER_WARNING",
+                            component="trading_worker",
+                            severity="WARNING",
+                            message="; ".join(prot_warnings),
+                            payload={"symbol": symbol, "warnings": prot_warnings},
+                        )
                     await self.portfolio_manager.open_position(
                         session,
                         account_id=account.id,
@@ -636,6 +911,11 @@ class AutonomousTradingLoop:
                         market_type="FUTURES",
                         leverage=trade_leverage,
                         margin_used=margin_used,
+                        initial_stop_distance_pct=stop_dist_pct,
+                        atr_at_entry=atr_entry,
+                        sl_order_id=sl_oid,
+                        tp_order_id=tp_oid,
+                        market_regime=regime.primary_regime.value,
                     )
                     executed_trades.append(
                         {
@@ -645,6 +925,8 @@ class AutonomousTradingLoop:
                             "fill_price": float(outcome.result.average_price),
                             "notional_usd": float(notional),
                             "margin_usd": float(margin_used),
+                            "sl_order_id": sl_oid,
+                            "tp_order_id": tp_oid,
                         }
                     )
                     avail_quote = await bal_mgr.get_quote_available(account.id, account.quote_currency)
@@ -661,10 +943,11 @@ class AutonomousTradingLoop:
 
         # Refresh survival state when no trade candidates were evaluated so resolved halts clear cleanly
         if not ranked_candidates and not account.emergency_stopped:
+            sync_utc_day_baseline(account, equity_summary.total_equity)
             dd_status = self.risk_manager.drawdown_monitor.evaluate(
                 current_equity=equity_summary.total_equity,
                 peak_equity=max(account.peak_equity, equity_summary.total_equity),
-                day_start_equity=account.initial_capital,
+                day_start_equity=account.day_start_equity,
             )
             verdict = self.survival.evaluate(
                 drawdown=dd_status,
@@ -731,83 +1014,41 @@ class AutonomousTradingLoop:
         *,
         strat: Any,
         primary_symbol: str,
+        regime_name: str,
         snaps: dict[str, Any],
         timeframe: str,
-    ) -> tuple[int, int, int, int]:
-        """Run cached zero-look-ahead historical validation across collected coins to prevent cold-start deadlock."""
-        cache_key = f"stats:bt:{strat.name}:{primary_symbol}:{timeframe}"
+        live_regime_stats: dict[tuple[str, str], dict[str, Any]],
+        per_symbol_cache: dict[tuple[str, str], tuple[int, int, int, int, list[float], list[float]]] | None = None,
+    ) -> StrategyValidationStats:
+        """
+        Run separated historical OOS validation with unified live exit rules & realized payoff metrics.
+        Separates historical evaluation slices from the current decision tail and enforces >=50-trade auto-disable.
+        """
+        ordered_syms = [primary_symbol, *[s for s in snaps.keys() if s != primary_symbol]][:8]
+        symbol_frames = [
+            (sym, snaps[sym].candles_df)
+            for sym in ordered_syms
+            if snaps.get(sym) is not None and getattr(snaps[sym], "candles_df", None) is not None and len(snaps[sym].candles_df) >= 120
+        ]
+        # Skip cache when live regime count reaches auto-disable evaluation territory so fresh closed trades take effect immediately
+        live_pair = live_regime_stats.get((strat.name, regime_name.upper())) or live_regime_stats.get((strat.name, "ALL"))
+        live_n = int(live_pair["trade_count"]) if live_pair else 0
+        cache_key = f"stats:bt_v2:{strat.name}:{primary_symbol}:{regime_name.upper()}:{timeframe}:n{live_n}"
         cached = await self.cache.get_json(cache_key)
         if cached:
-            return (
-                int(cached.get("w", 0)),
-                int(cached.get("l", 0)),
-                int(cached.get("ow", 0)),
-                int(cached.get("ol", 0)),
-            )
+            return StrategyValidationStats(**cached)
 
-        ordered_syms = [primary_symbol, *[s for s in snaps.keys() if s != primary_symbol]][:8]
-        sym_outcomes: dict[str, list[int]] = {}
-        missing_syms: list[str] = []
-        for sym in ordered_syms:
-            sym_cache = await self.cache.get_json(f"stats:bt_sym:{strat.name}:{sym}:{timeframe}")
-            if sym_cache and isinstance(sym_cache.get("outcomes"), list):
-                sym_outcomes[sym] = [int(v) for v in sym_cache["outcomes"]]
-            else:
-                snap = snaps.get(sym)
-                df = getattr(snap, "candles_df", None)
-                if df is not None and len(df) >= 80:
-                    missing_syms.append(sym)
-
-        if missing_syms:
-            def _compute_missing() -> dict[str, list[int]]:
-                engine = BacktestEngine(
-                    initial_capital=100.0,
-                    fee_rate=0.001,
-                    slippage_bps=4.0,
-                    spread_bps=3.0,
-                    risk_per_trade=float(self.settings.max_risk_per_trade),
-                )
-                computed: dict[str, list[int]] = {}
-                running_total = sum(len(v) for v in sym_outcomes.values())
-                for sym in missing_syms:
-                    df = snaps[sym].candles_df
-                    res = engine.run(strat, sym, df, allow_short=True)
-                    outcomes = [1 if tr.pnl > 0 else 0 for tr in res.trades]
-                    computed[sym] = outcomes
-                    running_total += len(outcomes)
-                    if running_total >= 28 and sym != primary_symbol:
-                        break
-                return computed
-
-            newly_computed = await asyncio.to_thread(_compute_missing)
-            for sym, outcomes in newly_computed.items():
-                sym_outcomes[sym] = outcomes
-                await self.cache.set_json(
-                    f"stats:bt_sym:{strat.name}:{sym}:{timeframe}",
-                    {"outcomes": outcomes},
-                    ttl_seconds=1800,
-                )
-
-        wins_all: list[int] = []
-        for sym in ordered_syms:
-            if sym in sym_outcomes:
-                wins_all.extend(sym_outcomes[sym])
-            if len(wins_all) >= 28 and sym != primary_symbol:
-                break
-
-        if not wins_all:
-            w, l, ow, ol = 0, 0, 0, 0
-        else:
-            split = max(1, int(len(wins_all) * 0.7))
-            is_slice = wins_all[:split]
-            oos_slice = wins_all[split:] or wins_all[-min(6, len(wins_all)):]
-            w = sum(is_slice)
-            l = len(is_slice) - w
-            ow = sum(oos_slice)
-            ol = len(oos_slice) - ow
-
-        await self.cache.set_json(cache_key, {"w": w, "l": l, "ow": ow, "ol": ol}, ttl_seconds=1800)
-        return w, l, ow, ol
+        stats = await asyncio.to_thread(
+            evaluate_separated_oos_stats,
+            strategy=strat,
+            regime_name=regime_name,
+            symbol_frames=symbol_frames,
+            live_regime_stats=live_regime_stats,
+            settings=self.settings,
+            per_symbol_cache=per_symbol_cache,
+        )
+        await self.cache.set_json(cache_key, stats.__dict__, ttl_seconds=1800)
+        return stats
 
 
 async def main() -> None:

@@ -127,7 +127,7 @@ export default function ExchangeTerminalPage() {
 
   const trades = active?.active_trades || [];
   const summ = active?.account_summary;
-  const maxHold = summ?.max_hold_minutes ?? 60;
+  const maxHold = summ?.max_hold_minutes ?? 240;
   const posOnSymbol = trades.find((t) => t.symbol === symbol);
   const coinRow = scanner?.coins.find((c) => c.symbol === symbol);
   const lastPx = market?.candles?.length
@@ -413,8 +413,8 @@ export default function ExchangeTerminalPage() {
             <Row k="Mark price" v={lastPx ? `$${fmtUsd(lastPx, pxDigits(lastPx))}` : "—"} />
             <Row k="Available" v={summ ? `$${fmtUsd(summ.available_usdt)} USDT` : "—"} />
             <Row k="Size" v="Auto (Fractional Kelly)" />
-            <Row k="TP / SL" v="+1.5% / −0.6% (fast +0.45%)" />
-            <Row k="Max hold" v={`${maxHold} min`} />
+            <Row k="TP / SL" v="≥ 2.0R / ATR (0.8–2.5%)" />
+            <Row k="Max hold" v={`${maxHold}m (60m MR)`} />
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -485,9 +485,9 @@ export default function ExchangeTerminalPage() {
             <ul className="space-y-1">
               <li>• Futures only, Isolated margin (1x default; auto 2x–5x only when needed for small balances)</li>
               <li>• Real USDT live Futures from any positive wallet balance (Binance / MEXC / KuCoin / Gate)</li>
-              <li>• Scans {scanner?.scanned ?? 64} global charts (15m + 5m) &amp; any coin searched in the world</li>
-              <li>• Trailing profit lock arms at +{summ?.fast_book_profit_pct?.toFixed(2) ?? "0.45"}% up to +1.5% TP</li>
-              <li>• After 30 min books any fee-covering gain; hard stop at {maxHold} min</li>
+              <li>• Scans {scanner?.scanned ?? 64} global charts (15m + 1h HTF) &amp; any coin searched in the world</li>
+              <li>• Books 50% at +1R to breakeven+fees; trails runner at 1.2x ATR (exchange SL/TP on Live)</li>
+              <li>• Trend cap {maxHold}m / MR 60m · UTC 00:00 daily cap · Max 2 same-side trades</li>
             </ul>
           </div>
         </aside>

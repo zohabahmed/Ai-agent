@@ -342,13 +342,19 @@ class CCXTExchangeAdapter(BaseExchange):
             else None
         )
 
+        order_type_up = request.order_type.upper()
         params: dict[str, Any] = {"newClientOrderId": request.client_order_id} if self.exchange_id == "binance" else {}
         if self.market_type == "FUTURES" and request.reduce_only:
             params["reduceOnly"] = True
+        if request.stop_price is not None and request.stop_price > 0:
+            stop_px = self._quantize(request.stop_price, precision=rules.price_precision)
+            params["stopPrice"] = float(stop_px)
+        if order_type_up in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            price_val = None
         try:
             res = await client.create_order(
                 symbol=resolved,
-                type=request.order_type.lower(),
+                type=order_type_up.lower(),
                 side=request.side.lower(),
                 amount=float(qty),
                 price=price_val,
