@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import csv
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
+import io
+import json
 from typing import Annotated, Any
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -114,6 +117,184 @@ async def get_trades(
     }
 
 
+@router.get("/trading/trades/export", dependencies=[Depends(rate_limit_guard)])
+@router.get("/trades/export", dependencies=[Depends(rate_limit_guard)])
+async def export_trades_history(
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    format: str = "csv",
+    scope: str = "closed",
+    limit: int = 5000,
+    mode: str | None = None,
+) -> Response:
+    """Download trade history containing coin, side, entry/exit prices, profit/loss, ROI, strategy, timestamps, and fees as CSV or JSON."""
+    repo = TradingRepository(session)
+    account = await repo.get_or_create_default_account()
+    norm_format = (format or "csv").strip().lower()
+    norm_scope = (scope or "closed").strip().lower()
+
+    if norm_scope in {"closed", "all", "positions"}:
+        stmt = select(Position).where(Position.account_id == account.id)
+        if norm_scope == "closed":
+            stmt = stmt.where(Position.status == "CLOSED")
+        if mode:
+            stmt = stmt.where(Position.trading_mode == mode.upper())
+        stmt = stmt.order_by(desc(Position.closed_at), desc(Position.opened_at)).limit(min(max(1, limit), 10000))
+        res = await session.execute(stmt)
+        positions = list(res.scalars().all())
+
+        rows: list[dict[str, Any]] = []
+        for pos in positions:
+            entry_px = float(pos.entry_price or Decimal("0"))
+            exit_px = float(pos.current_price or Decimal("0"))
+            qty = float(pos.quantity or Decimal("0"))
+            entry_notional = round(qty * entry_px, 4)
+            exit_notional = round(qty * exit_px, 4)
+            margin_used = float(pos.margin_used or Decimal("0"))
+            realized_pnl = float(pos.realized_pnl or Decimal("0"))
+
+            roi_pct: float = 0.0
+            if margin_used > 0:
+                roi_pct = round((realized_pnl / margin_used) * 100.0, 2)
+            elif pos.net_pnl_pct is not None:
+                roi_pct = round(float(pos.net_pnl_pct) * 100.0, 2)
+            elif entry_notional > 0:
+                roi_pct = round((realized_pnl / entry_notional) * 100.0, 2)
+
+            price_return_pct = round(float(pos.net_pnl_pct) * 100.0, 2) if pos.net_pnl_pct is not None else 0.0
+
+            duration_minutes: float | None = None
+            if pos.closed_at and pos.opened_at:
+                opened_dt = pos.opened_at if pos.opened_at.tzinfo else pos.opened_at.replace(tzinfo=timezone.utc)
+                closed_dt = pos.closed_at if pos.closed_at.tzinfo else pos.closed_at.replace(tzinfo=timezone.utc)
+                duration_minutes = round(max(0.0, (closed_dt - opened_dt).total_seconds() / 60.0), 2)
+
+            rows.append(
+                {
+                    "Trade ID": str(pos.id),
+                    "Coin": pos.symbol.replace("/", ""),
+                    "Pair": pos.symbol,
+                    "Side": pos.side,
+                    "Status": pos.status,
+                    "Trading Mode": pos.trading_mode,
+                    "Market Type": pos.market_type,
+                    "Leverage": f"{pos.leverage}x",
+                    "Quantity": qty,
+                    "Entry Price ($)": entry_px,
+                    "Exit Price ($)": exit_px,
+                    "Entry Notional ($)": entry_notional,
+                    "Exit Notional ($)": exit_notional,
+                    "Margin Used ($)": margin_used,
+                    "Realized Profit/Loss ($)": realized_pnl,
+                    "ROI (%)": roi_pct,
+                    "Price Return (%)": price_return_pct,
+                    "Fee Paid ($)": float(pos.entry_fee or Decimal("0")),
+                    "Strategy": pos.strategy_name,
+                    "Market Regime": pos.market_regime or "UNKNOWN",
+                    "Exit Reason": pos.exit_reason or "CLOSED",
+                    "Stop Loss ($)": float(pos.stop_loss) if pos.stop_loss else "",
+                    "Take Profit ($)": float(pos.take_profit) if pos.take_profit else "",
+                    "Stop Loss Order ID": pos.sl_order_id or "",
+                    "Take Profit Order ID": pos.tp_order_id or "",
+                    "Scaled Out 1R": "YES" if pos.scaled_out else "NO",
+                    "Opened At (UTC)": pos.opened_at.isoformat() if pos.opened_at else "",
+                    "Closed At (UTC)": pos.closed_at.isoformat() if pos.closed_at else "",
+                    "Hold Duration (Minutes)": duration_minutes if duration_minutes is not None else "",
+                }
+            )
+    elif norm_scope == "executions":
+        trades = await repo.get_recent_trades(account.id, limit=min(max(1, limit), 10000))
+        rows = [
+            {
+                "Execution ID": str(t.id),
+                "Exchange Trade ID": t.exchange_trade_id,
+                "Exchange": t.exchange,
+                "Coin": t.symbol.replace("/", ""),
+                "Pair": t.symbol,
+                "Side": t.side,
+                "Trading Mode": t.trading_mode,
+                "Strategy": t.strategy_name,
+                "Market Regime": t.market_regime,
+                "Quantity": float(t.quantity or Decimal("0")),
+                "Price ($)": float(t.price or Decimal("0")),
+                "Notional ($)": float(t.notional or Decimal("0")),
+                "Fee ($)": float(t.fee or Decimal("0")),
+                "Slippage (bps)": float(t.slippage_bps or Decimal("0")),
+                "Realized PnL ($)": float(t.realized_pnl) if t.realized_pnl is not None else "",
+                "Is Simulated": "YES" if t.is_simulated else "NO",
+                "Executed At (UTC)": t.executed_at.isoformat() if t.executed_at else "",
+            }
+            for t in trades
+        ]
+    else:
+        raise HTTPException(status_code=400, detail="Invalid scope: choose 'closed', 'executions', or 'all'.")
+
+    timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if norm_format == "json":
+        filename = f"survivalx_trades_{norm_scope}_{timestamp_str}.json"
+        content_str = json.dumps({"count": len(rows), "trades": rows}, indent=2)
+        return Response(
+            content=content_str,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
+        )
+
+    output = io.StringIO()
+    if rows:
+        headers = list(rows[0].keys())
+        writer = csv.DictWriter(output, fieldnames=headers)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    else:
+        default_headers = [
+            "Trade ID",
+            "Coin",
+            "Pair",
+            "Side",
+            "Status",
+            "Trading Mode",
+            "Market Type",
+            "Leverage",
+            "Quantity",
+            "Entry Price ($)",
+            "Exit Price ($)",
+            "Entry Notional ($)",
+            "Exit Notional ($)",
+            "Margin Used ($)",
+            "Realized Profit/Loss ($)",
+            "ROI (%)",
+            "Price Return (%)",
+            "Fee Paid ($)",
+            "Strategy",
+            "Market Regime",
+            "Exit Reason",
+            "Stop Loss ($)",
+            "Take Profit ($)",
+            "Stop Loss Order ID",
+            "Take Profit Order ID",
+            "Scaled Out 1R",
+            "Opened At (UTC)",
+            "Closed At (UTC)",
+            "Hold Duration (Minutes)",
+        ]
+        writer = csv.DictWriter(output, fieldnames=default_headers)
+        writer.writeheader()
+
+    filename = f"survivalx_trades_{norm_scope}_{timestamp_str}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
 @router.post("/trading/start", dependencies=[Depends(rate_limit_guard)])
 async def start_trading(
     user: Annotated[User, Depends(require_role(Role.OPERATOR))],
@@ -145,6 +326,8 @@ async def start_trading(
         account.peak_equity = max(account.peak_equity, total_bal)
         if account.initial_capital <= Decimal("0"):
             account.initial_capital = total_bal
+        account.day_start_equity = total_bal
+        account.day_start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         account.survival_state = "NORMAL"
         survival.state = SurvivalState.NORMAL
 

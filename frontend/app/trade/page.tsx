@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import {
   Activity,
   Bot,
+  Download,
   Radar,
   RefreshCw,
   SlidersHorizontal,
@@ -63,6 +64,19 @@ export default function ActiveTradeOnlyPage() {
   const [slInput, setSlInput] = useState<string>("");
   const [tpInput, setTpInput] = useState<string>("");
   const [tpSlBusy, setTpSlBusy] = useState<boolean>(false);
+  const [downloadingHistory, setDownloadingHistory] = useState<boolean>(false);
+
+  const handleDownloadHistory = async (format: "csv" | "json" = "csv") => {
+    setDownloadingHistory(true);
+    try {
+      const filename = await TradingApi.downloadTradesHistory(token, format, "closed");
+      notify(`Downloaded ${filename} successfully.`, true);
+    } catch (err: any) {
+      notify(err?.message || "Failed to download trade history", false);
+    } finally {
+      setDownloadingHistory(false);
+    }
+  };
 
   const normalizePair = (raw: string): string => {
     const clean = raw.trim().toUpperCase().replace("-", "/");
@@ -172,6 +186,16 @@ export default function ActiveTradeOnlyPage() {
           >
             <RefreshCw className="h-3.5 w-3.5" />
             <span>Refresh Live</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleDownloadHistory("csv")}
+            disabled={downloadingHistory}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-300 hover:bg-amber-500/20 hover:text-amber-200 transition disabled:opacity-50"
+            title="Download closed trades history as CSV"
+          >
+            <Download className="h-3.5 w-3.5" />
+            <span>{downloadingHistory ? "Downloading…" : "Download Trades (CSV)"}</span>
           </button>
         </div>
       </div>
@@ -804,6 +828,98 @@ export default function ActiveTradeOnlyPage() {
             </div>
           </section>
         </>
+      )}
+
+      {/* Recently Closed Trades Section */}
+      {active?.recently_closed && active.recently_closed.length > 0 && (
+        <section className="rounded-lg border border-[#1f2937] bg-[#0e141d] p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                Recently Closed Trades ({active.recently_closed.length})
+              </h2>
+              <p className="text-[11px] text-slate-500">
+                Full lifecycle history: profit/loss, entry/exit prices, fees, and execution details
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("csv")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs font-bold text-amber-300 hover:bg-amber-500/25 hover:text-amber-200 transition disabled:opacity-50"
+                title="Download closed trades history as CSV"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>{downloadingHistory ? "Downloading…" : "Download Trades (CSV)"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("json")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1 rounded-lg border border-[#2b3545] bg-[#161f2c] px-2.5 py-1.5 text-xs font-semibold text-slate-300 hover:bg-[#1f2937] hover:text-white transition disabled:opacity-50"
+                title="Download closed trades history as JSON"
+              >
+                <span>JSON</span>
+              </button>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[850px] text-xs">
+              <thead className="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                <tr>
+                  {["Symbol", "Side", "Leverage", "Strategy", "Qty", "Entry", "Exit", "Realized P&L", "ROI %", "Exit Reason", "Closed At"].map((h) => (
+                    <th key={h} className="py-2 font-medium">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {active.recently_closed.map((c) => {
+                  const roi =
+                    c.net_pnl_pct !== null && c.net_pnl_pct !== undefined
+                      ? c.net_pnl_pct
+                      : c.entry_price > 0 && c.quantity > 0
+                      ? (c.realized_pnl / (c.entry_price * c.quantity)) * 100
+                      : 0;
+                  return (
+                    <tr key={c.id} className="border-t border-[#161e2b] hover:bg-[#131b26]">
+                      <td className="py-2 font-semibold text-white">{c.symbol}</td>
+                      <td className={c.side === "SHORT" ? "text-rose-400 font-semibold" : "text-emerald-400 font-semibold"}>
+                        <span className={`rounded px-1 text-[10px] ${c.side === "SHORT" ? "bg-rose-500/15" : "bg-emerald-500/15"}`}>
+                          {c.side}
+                        </span>
+                      </td>
+                      <td className="font-mono text-amber-300">{c.leverage ? `${c.leverage}x` : "1x"}</td>
+                      <td className="text-slate-400 text-[11px]">{c.strategy_name || "—"}</td>
+                      <td className="font-mono">{c.quantity.toFixed(4)}</td>
+                      <td className="font-mono">${fmtUsd(c.entry_price, pxDigits(c.entry_price))}</td>
+                      <td className="font-mono">${fmtUsd(c.exit_price, pxDigits(c.exit_price))}</td>
+                      <td className={`font-mono font-bold ${c.realized_pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {c.realized_pnl >= 0 ? "+" : ""}${fmtUsd(c.realized_pnl, 4)}
+                      </td>
+                      <td className={`font-mono font-bold ${roi >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {roi >= 0 ? "+" : ""}{roi.toFixed(2)}%
+                      </td>
+                      <td className="text-[11px] text-slate-400">{c.exit_reason || "CLOSED"}</td>
+                      <td className="text-slate-400">
+                        {c.closed_at
+                          ? new Date(c.closed_at).toLocaleString([], {
+                              month: "short",
+                              day: "numeric",
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
       )}
     </main>
   );

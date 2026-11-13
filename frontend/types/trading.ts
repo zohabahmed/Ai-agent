@@ -499,6 +499,9 @@ export interface ActiveTradesResponse {
     market_type: string;
     leverage: number;
     strategy_name: string;
+    market_regime?: string;
+    exit_reason?: string;
+    net_pnl_pct?: number | null;
     quantity: number;
     entry_price: number;
     exit_price: number;

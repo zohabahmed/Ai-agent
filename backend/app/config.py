@@ -93,8 +93,8 @@ class Settings(BaseSettings):
     kelly_mode: KellyMode = KellyMode.NORMAL
     kelly_multiplier: Decimal = Field(default=Decimal("0.20"), gt=Decimal("0"), le=Decimal("0.25"))
     max_risk_per_trade: Decimal = Field(default=Decimal("0.015"), gt=Decimal("0"), le=Decimal("0.10"))
-    max_daily_loss: Decimal = Field(default=Decimal("0.01"), gt=Decimal("0"), le=Decimal("0.50"))
-    max_drawdown: Decimal = Field(default=Decimal("0.05"), gt=Decimal("0"), le=Decimal("0.50"))
+    max_daily_loss: Decimal = Field(default=Decimal("0.05"), gt=Decimal("0"), le=Decimal("0.50"))
+    max_drawdown: Decimal = Field(default=Decimal("0.10"), gt=Decimal("0"), le=Decimal("0.50"))
     max_open_positions: int = Field(default=3, ge=1, le=20)
     max_leverage: int = Field(default=1, ge=1, le=1)
     min_viable_order_ratio: Decimal = Field(default=Decimal("0.01"), gt=Decimal("0"))

@@ -192,4 +192,54 @@ export const TradingApi = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
+  exportTradesHistoryBlob: async (
+    token: string = "direct-operator",
+    format: "csv" | "json" = "csv",
+    scope: "closed" | "executions" | "all" = "closed"
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const effectiveToken = token || "direct-operator";
+    const res = await fetch(
+      `${API_BASE}/trading/trades/export?format=${format}&scope=${scope}`,
+      {
+        headers: {
+          Authorization: `Bearer ${effectiveToken}`,
+        },
+        cache: "no-store",
+      }
+    );
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const data = await res.json();
+        detail = data.detail || JSON.stringify(data);
+      } catch {
+        detail = await res.text();
+      }
+      throw new Error(detail || "Failed to download trades history");
+    }
+    const disposition = res.headers.get("Content-Disposition") || "";
+    let filename = `survivalx_trade_history_${new Date().toISOString().slice(0, 10)}.${format}`;
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    if (match && match[1]) {
+      filename = match[1].trim();
+    }
+    const blob = await res.blob();
+    return { blob, filename };
+  },
+  downloadTradesHistory: async (
+    token: string = "direct-operator",
+    format: "csv" | "json" = "csv",
+    scope: "closed" | "executions" | "all" = "closed"
+  ): Promise<string> => {
+    const { blob, filename } = await TradingApi.exportTradesHistoryBlob(token, format, scope);
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+    return filename;
+  },
 };

@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   ArrowRight,
   Bot,
+  Download,
   Pin,
   RefreshCw,
   Search,
@@ -77,6 +78,19 @@ export default function ExchangeTerminalPage() {
   const [searchBusy, setSearchBusy] = useState(false);
   const [tab, setTab] = useState<"POSITIONS" | "HISTORY" | "LOG">("POSITIONS");
   const [, setTick] = useState(0);
+  const [downloadingHistory, setDownloadingHistory] = useState(false);
+
+  const handleDownloadHistory = async (format: "csv" | "json" = "csv") => {
+    setDownloadingHistory(true);
+    try {
+      const filename = await TradingApi.downloadTradesHistory(token, format, "closed");
+      notify(`Downloaded ${filename} successfully.`, true);
+    } catch (err: any) {
+      notify(err?.message || "Failed to download trade history", false);
+    } finally {
+      setDownloadingHistory(false);
+    }
+  };
 
   useEffect(() => {
     if (!symbolManual && scanner?.coins?.length) {
@@ -514,7 +528,7 @@ export default function ExchangeTerminalPage() {
               {label}
             </button>
           ))}
-          {trades.length > 0 && (
+          {tab === "POSITIONS" && trades.length > 0 && (
             <div className="ml-auto flex items-center gap-2">
               <Link
                 href="/trade"
@@ -529,6 +543,29 @@ export default function ExchangeTerminalPage() {
                 className="rounded-lg bg-rose-600/85 px-3 py-1 text-xs font-bold text-white hover:bg-rose-500 disabled:opacity-50"
               >
                 {busy === "close-all" ? "Closing…" : "Close All"}
+              </button>
+            </div>
+          )}
+          {tab === "HISTORY" && (
+            <div className="ml-auto flex items-center gap-2 py-1">
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("csv")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 px-3 py-1 text-xs font-bold text-amber-300 hover:bg-amber-500/25 hover:text-amber-200 transition disabled:opacity-50"
+                title="Download closed trade history with coin, entry/exit, profit/loss, and fees as CSV"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>{downloadingHistory ? "Downloading…" : "Download Trades (CSV)"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("json")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1 rounded-lg border border-[#2b3545] bg-[#161f2c] px-2.5 py-1 text-xs font-semibold text-slate-300 hover:bg-[#1f2937] hover:text-white transition disabled:opacity-50"
+                title="Download closed trade history as JSON"
+              >
+                <span>JSON</span>
               </button>
             </div>
           )}
@@ -601,34 +638,96 @@ export default function ExchangeTerminalPage() {
               </div>
             ))}
 
-          {tab === "HISTORY" && (
-            <table className="w-full min-w-[800px] text-xs">
-              <thead className="text-left text-[11px] uppercase tracking-wider text-slate-500">
-                <tr>
-                  {["Symbol", "Side", "Qty", "Entry", "Exit", "Realized P&L", "Closed"].map((h) => (
-                    <th key={h} className="py-2 font-medium">
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {(active?.recently_closed || []).map((c) => (
-                  <tr key={c.id} className="border-t border-[#161e2b]">
-                    <td className="py-2 font-semibold text-white">{c.symbol}</td>
-                    <td className={c.side === "SHORT" ? "text-rose-400" : "text-emerald-400"}>{c.side}</td>
-                    <td className="font-mono">{c.quantity.toFixed(4)}</td>
-                    <td className="font-mono">${fmtUsd(c.entry_price, pxDigits(c.entry_price))}</td>
-                    <td className="font-mono">${fmtUsd(c.exit_price, pxDigits(c.exit_price))}</td>
-                    <td className={`font-mono font-bold ${pnlCls(c.realized_pnl)}`}>
-                      {sign(c.realized_pnl)}${fmtUsd(c.realized_pnl, 4)}
-                    </td>
-                    <td className="text-slate-400">{c.closed_at ? new Date(c.closed_at).toLocaleTimeString() : "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+          {tab === "HISTORY" &&
+            ((active?.recently_closed || []).length ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                  <span>
+                    Showing {active?.recently_closed.length} closed trade(s) with full profit/loss, entry/exit prices, fees, and execution details.
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleDownloadHistory("csv")}
+                      disabled={downloadingHistory}
+                      className="inline-flex items-center gap-1 font-semibold text-amber-400 hover:text-amber-300 underline disabled:opacity-50"
+                    >
+                      <Download className="h-3 w-3" />
+                      <span>Export Trade Log (CSV)</span>
+                    </button>
+                    <span>·</span>
+                    <button
+                      type="button"
+                      onClick={() => void handleDownloadHistory("json")}
+                      disabled={downloadingHistory}
+                      className="text-slate-400 hover:text-white underline disabled:opacity-50"
+                    >
+                      JSON
+                    </button>
+                  </div>
+                </div>
+                <table className="w-full min-w-[950px] text-xs">
+                  <thead className="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                    <tr>
+                      {["Symbol", "Side", "Leverage", "Strategy", "Qty", "Entry", "Exit", "Realized P&L", "ROI %", "Exit Reason", "Closed"].map((h) => (
+                        <th key={h} className="py-2 font-medium">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(active?.recently_closed || []).map((c) => {
+                      const roi =
+                        c.net_pnl_pct !== null && c.net_pnl_pct !== undefined
+                          ? c.net_pnl_pct
+                          : c.entry_price > 0 && c.quantity > 0
+                          ? (c.realized_pnl / (c.entry_price * c.quantity)) * 100
+                          : 0;
+                      return (
+                        <tr key={c.id} className="border-t border-[#161e2b] hover:bg-[#131b26]">
+                          <td className="py-2 font-semibold text-white">{c.symbol}</td>
+                          <td className={c.side === "SHORT" ? "text-rose-400 font-semibold" : "text-emerald-400 font-semibold"}>
+                            <span className={`rounded px-1 text-[10px] ${c.side === "SHORT" ? "bg-rose-500/15" : "bg-emerald-500/15"}`}>
+                              {c.side}
+                            </span>
+                          </td>
+                          <td className="font-mono text-amber-300">{c.leverage ? `${c.leverage}x` : "1x"}</td>
+                          <td className="text-slate-400 text-[11px]">{c.strategy_name || "—"}</td>
+                          <td className="font-mono">{c.quantity.toFixed(4)}</td>
+                          <td className="font-mono">${fmtUsd(c.entry_price, pxDigits(c.entry_price))}</td>
+                          <td className="font-mono">${fmtUsd(c.exit_price, pxDigits(c.exit_price))}</td>
+                          <td className={`font-mono font-bold ${pnlCls(c.realized_pnl)}`}>
+                            {sign(c.realized_pnl)}${fmtUsd(c.realized_pnl, 4)}
+                          </td>
+                          <td className={`font-mono font-bold ${pnlCls(roi)}`}>
+                            {sign(roi)}{roi.toFixed(2)}%
+                          </td>
+                          <td className="text-[11px] text-slate-400">{c.exit_reason || "CLOSED"}</td>
+                          <td className="text-slate-400">
+                            {c.closed_at
+                              ? new Date(c.closed_at).toLocaleString([], {
+                                  month: "short",
+                                  day: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })
+                              : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="py-10 text-center text-xs text-slate-500 space-y-2">
+                <div>No closed trades in history yet.</div>
+                <div className="text-[11px] text-slate-600">
+                  When trades exit, all details (coin, entry/exit prices, profit/loss, ROI %, fees, and hold time) will be displayed here and can be downloaded as a CSV file.
+                </div>
+              </div>
+            ))}
 
           {tab === "LOG" && (
             <div className="max-h-72 space-y-1 overflow-y-auto py-2 font-mono text-[11px]">

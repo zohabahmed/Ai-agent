@@ -2,7 +2,7 @@
 
 import React from "react";
 import Link from "next/link";
-import { BarChart3, KeyRound, ShieldCheck } from "lucide-react";
+import { BarChart3, Download, KeyRound, ShieldCheck } from "lucide-react";
 import {
   Area,
   AreaChart,
@@ -19,6 +19,7 @@ import {
 import CoinMarketChart from "@/components/CoinMarketChart";
 import { ExchangeSetupPanel } from "@/components/ExchangeSetupPanel";
 import { useTradingContext } from "@/context/TradingContext";
+import { TradingApi } from "@/services/api";
 
 export default function AnalyticsAndSettingsPage() {
   const {
@@ -35,6 +36,20 @@ export default function AnalyticsAndSettingsPage() {
     notify,
     handleApprovalDecision,
   } = useTradingContext();
+
+  const [downloadingHistory, setDownloadingHistory] = React.useState(false);
+
+  const handleDownloadHistory = async (format: "csv" | "json" = "csv") => {
+    setDownloadingHistory(true);
+    try {
+      const filename = await TradingApi.downloadTradesHistory(token, format, "closed");
+      notify(`Downloaded ${filename} successfully.`, true);
+    } catch (err: any) {
+      notify(err?.message || "Failed to download trade history", false);
+    } finally {
+      setDownloadingHistory(false);
+    }
+  };
 
   if (loading && !dash) {
     return (
@@ -284,9 +299,32 @@ export default function AnalyticsAndSettingsPage() {
       {/* 4. STRATEGY COMPETITION & OPEN POSITIONS / DECISIONS */}
       <section id="strategies-table" className="scroll-mt-24 grid grid-cols-1 gap-4 lg:grid-cols-12">
         <div className="lg:col-span-7 rounded-lg border border-[#1f2937] bg-[#0e141d] p-4">
-          <h2 className="mb-3 text-sm font-semibold text-white">
-            Independent Multi-Strategy Engine &amp; Regime Specialization
-          </h2>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-white">
+              Independent Multi-Strategy Engine &amp; Regime Specialization
+            </h2>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("csv")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-bold text-amber-300 hover:bg-amber-500/25 hover:text-amber-200 transition disabled:opacity-50"
+                title="Download closed trade history as CSV"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>{downloadingHistory ? "Downloading…" : "Download History (CSV)"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDownloadHistory("json")}
+                disabled={downloadingHistory}
+                className="inline-flex items-center gap-1 rounded-lg border border-[#2b3545] bg-[#161f2c] px-2 py-1 text-xs font-semibold text-slate-300 hover:bg-[#1f2937] hover:text-white transition disabled:opacity-50"
+                title="Download closed trade history as JSON"
+              >
+                <span>JSON</span>
+              </button>
+            </div>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="border-b border-[#1f2937] text-slate-400">

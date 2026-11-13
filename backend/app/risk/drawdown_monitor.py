@@ -41,12 +41,28 @@ class DrawdownMonitor:
         else:
             daily_loss_pct = Decimal("0")
 
-        dd_breached = dd_pct >= self.max_drawdown
-        daily_breached = daily_loss_pct >= self.max_daily_loss
-        near_limit = (
-            dd_pct >= self.max_drawdown * Decimal("0.60")
-            or daily_loss_pct >= self.max_daily_loss * Decimal("0.60")
-        )
+        # For micro balances (e.g. <= $25.00), normal exchange fees and tick noise (5-10 cents)
+        # equal 1-2% of total equity. Enforce sensible USD floors so cents of fee noise never trigger halts.
+        is_micro_balance = day_start_equity <= Decimal("25.00") or effective_peak <= Decimal("25.00")
+        daily_loss_usd = max(Decimal("0"), day_start_equity - current_equity)
+        drawdown_usd = max(Decimal("0"), effective_peak - current_equity)
+
+        if is_micro_balance:
+            eff_max_daily = max(self.max_daily_loss, Decimal("0.15"))
+            eff_max_dd = max(self.max_drawdown, Decimal("0.25"))
+            daily_breached = daily_loss_pct >= eff_max_daily and daily_loss_usd >= Decimal("0.75")
+            dd_breached = dd_pct >= eff_max_dd and drawdown_usd >= Decimal("1.25")
+            near_limit = (
+                (daily_loss_pct >= eff_max_daily * Decimal("0.60") and daily_loss_usd >= Decimal("0.45"))
+                or (dd_pct >= eff_max_dd * Decimal("0.60") and drawdown_usd >= Decimal("0.75"))
+            )
+        else:
+            dd_breached = dd_pct >= self.max_drawdown
+            daily_breached = daily_loss_pct >= self.max_daily_loss
+            near_limit = (
+                dd_pct >= self.max_drawdown * Decimal("0.60")
+                or daily_loss_pct >= self.max_daily_loss * Decimal("0.60")
+            )
         return DrawdownStatus(
             peak_equity=effective_peak,
             current_equity=current_equity,
