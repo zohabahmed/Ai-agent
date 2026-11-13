@@ -15,6 +15,7 @@ from app.exchanges.base_exchange import (
     BaseExchange,
     ExchangeBalance,
     ExchangeError,
+    ExchangePosition,
     MarketRules,
     OrderBook,
     OrderBookLevel,
@@ -302,10 +303,43 @@ class CCXTExchangeAdapter(BaseExchange):
         total_map = raw.get("total", {}) or {}
         free_map = raw.get("free", {}) or {}
         used_map = raw.get("used", {}) or {}
-        for asset, tot in total_map.items():
-            t_dec = Decimal(str(tot or 0))
+
+        futures_wallet_map: dict[str, tuple[Decimal, Decimal]] = {}
+        if self.market_type == "FUTURES":
+            info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+            assets_info = info.get("assets") if isinstance(info.get("assets"), list) else []
+            for entry in assets_info:
+                if not isinstance(entry, dict):
+                    continue
+                asset_code = str(entry.get("asset") or "").upper()
+                if not asset_code:
+                    continue
+                try:
+                    wb = Decimal(str(entry.get("walletBalance") or 0))
+                    ab = Decimal(str(entry.get("availableBalance") or 0))
+                except Exception:
+                    continue
+                if wb > 0 or ab > 0:
+                    futures_wallet_map[asset_code] = (wb, ab)
+
+        all_assets = (
+            set(total_map.keys())
+            | set(free_map.keys())
+            | set(used_map.keys())
+            | set(futures_wallet_map.keys())
+        )
+        for asset in all_assets:
+            t_dec = Decimal(str(total_map.get(asset, 0) or 0))
             f_dec = Decimal(str(free_map.get(asset, 0) or 0))
             u_dec = Decimal(str(used_map.get(asset, 0) or 0))
+            if asset in futures_wallet_map:
+                wb_dec, ab_dec = futures_wallet_map[asset]
+                f_dec = ab_dec if ab_dec >= 0 else f_dec
+                u_dec = max(Decimal("0"), wb_dec - f_dec)
+                t_dec = max(wb_dec, f_dec + u_dec)
+            elif self.market_type == "FUTURES" and t_dec > f_dec + u_dec:
+                u_dec = max(u_dec, t_dec - f_dec)
+                t_dec = f_dec + u_dec
             if t_dec > 0 or f_dec > 0 or u_dec > 0:
                 balances[asset] = ExchangeBalance(asset=asset, free=f_dec, used=u_dec, total=t_dec)
         return balances
@@ -344,6 +378,8 @@ class CCXTExchangeAdapter(BaseExchange):
 
         order_type_up = request.order_type.upper()
         params: dict[str, Any] = {"newClientOrderId": request.client_order_id} if self.exchange_id == "binance" else {}
+        if self.exchange_id == "binance" and order_type_up == "MARKET":
+            params["newOrderRespType"] = "RESULT" if self.market_type == "FUTURES" else "FULL"
         if self.market_type == "FUTURES" and request.reduce_only:
             params["reduceOnly"] = True
         if request.stop_price is not None and request.stop_price > 0:
@@ -362,7 +398,45 @@ class CCXTExchangeAdapter(BaseExchange):
             )
         except Exception as exc:
             raise ExchangeError(f"Order submission failed on {self.exchange_id}: {_safe_exc_summary(exc)}") from exc
-        return self._map_order_result(res, request.client_order_id, request.symbol)
+
+        result = self._map_order_result(res, request.client_order_id, request.symbol)
+        # Binance / CCXT MARKET responses can return avgPrice=0 (ACK) before matching finishes.
+        if order_type_up == "MARKET" and result.exchange_order_id and (
+            result.average_price is None or result.average_price <= 0 or result.filled_quantity <= 0
+        ):
+            for _ in range(2):
+                try:
+                    await asyncio.sleep(0.2)
+                    fetched = await self.fetch_order(result.exchange_order_id, request.symbol)
+                    if fetched.average_price and fetched.average_price > 0:
+                        result = fetched
+                        break
+                    if fetched.filled_quantity > result.filled_quantity:
+                        result = fetched
+                except Exception:
+                    break
+            if (result.average_price is None or result.average_price <= 0) and result.filled_quantity > 0:
+                try:
+                    tk = await self.fetch_ticker(request.symbol)
+                    if tk.last > 0:
+                        result = OrderResult(
+                            exchange_order_id=result.exchange_order_id,
+                            client_order_id=result.client_order_id,
+                            symbol=result.symbol,
+                            side=result.side,
+                            order_type=result.order_type,
+                            status=result.status,
+                            requested_quantity=result.requested_quantity,
+                            filled_quantity=result.filled_quantity,
+                            average_price=tk.last,
+                            fee=result.fee,
+                            fee_asset=result.fee_asset,
+                            timestamp=result.timestamp,
+                            raw=result.raw,
+                        )
+                except Exception:
+                    pass
+        return result
 
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> OrderResult:
         if self._read_only:
@@ -393,6 +467,125 @@ class CCXTExchangeAdapter(BaseExchange):
             return await client.fetch_my_trades(resolved, limit=limit)
         except Exception as exc:
             raise ExchangeError(f"Fetch trades failed: {type(exc).__name__}") from exc
+
+    async def fetch_positions(self) -> list[ExchangePosition]:
+        if self.market_type != "FUTURES":
+            return []
+        if not self._api_key or not self._api_secret:
+            raise ExchangeError("Exchange API credentials are not configured.")
+        client = await self._ensure_connected()
+        try:
+            raw_positions = await client.fetch_positions()
+        except Exception as exc:
+            raise ExchangeError(f"Position fetch failed on {self.exchange_id}: {type(exc).__name__}") from exc
+
+        out: list[ExchangePosition] = []
+        markets = client.markets or {}
+        for p in raw_positions or []:
+            if not isinstance(p, dict):
+                continue
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            contracts_raw = p.get("contracts")
+            if contracts_raw is None:
+                contracts = Decimal(str(info.get("positionAmt") or 0))
+            else:
+                contracts = Decimal(str(contracts_raw or 0))
+            if contracts == 0:
+                continue
+
+            raw_sym = str(p.get("symbol") or "")
+            clean_sym = self._clean_symbol_key(raw_sym)
+            if not clean_sym:
+                continue
+
+            market_obj = markets.get(raw_sym) or markets.get(clean_sym) or {}
+            contract_size = Decimal(str(p.get("contractSize") or market_obj.get("contractSize") or 1))
+            if contract_size <= 0:
+                contract_size = Decimal("1")
+
+            qty = abs(contracts) * contract_size
+            side_raw = str(p.get("side") or "").upper()
+            side = "SHORT" if (side_raw in {"SHORT", "SELL"} or contracts < 0) else "LONG"
+
+            entry_px = Decimal(str(p.get("entryPrice") or info.get("entryPrice") or 0))
+            mark_px = Decimal(str(p.get("markPrice") or info.get("markPrice") or entry_px or 0))
+            notional = abs(Decimal(str(p.get("notional") or info.get("notional") or (qty * mark_px) or 0)))
+
+            isolated_wallet = Decimal(str(info.get("isolatedWallet") or 0))
+            initial_margin = Decimal(
+                str(p.get("initialMargin") or info.get("positionInitialMargin") or info.get("initialMargin") or 0)
+            )
+            collateral = Decimal(str(p.get("collateral") or 0))
+            margin_mode = str(
+                p.get("marginMode")
+                or ("isolated" if str(info.get("isolated") or "").lower() == "true" or isolated_wallet > 0 else "cross")
+            ).lower()
+            if isolated_wallet > 0:
+                margin_used = isolated_wallet
+            elif initial_margin > 0:
+                margin_used = initial_margin
+            else:
+                margin_used = collateral
+
+            raw_lev = p.get("leverage") or info.get("leverage")
+            if raw_lev is not None and Decimal(str(raw_lev)) > 0:
+                leverage = Decimal(str(raw_lev))
+            elif initial_margin > 0 and notional > 0:
+                leverage = max(Decimal("1"), (notional / initial_margin).quantize(Decimal("1")))
+            elif margin_used > 0 and notional > 0:
+                leverage = max(Decimal("1"), (notional / margin_used).quantize(Decimal("1")))
+            else:
+                leverage = Decimal(str(self.leverage or 1))
+
+            u_pnl_raw = p.get("unrealizedPnl")
+            if u_pnl_raw is None:
+                u_pnl_raw = info.get("unRealizedProfit")
+            u_pnl = Decimal(str(u_pnl_raw or 0))
+
+            liq_raw = p.get("liquidationPrice") or info.get("liquidationPrice")
+            liq_px: Decimal | None = None
+            if liq_raw not in (None, "", 0, "0"):
+                liq_dec = Decimal(str(liq_raw))
+                if liq_dec > 0:
+                    liq_px = liq_dec
+
+            sl_raw = p.get("stopLossPrice")
+            tp_raw = p.get("takeProfitPrice")
+            out.append(
+                ExchangePosition(
+                    symbol=clean_sym,
+                    side=side,
+                    quantity=qty,
+                    entry_price=entry_px,
+                    mark_price=mark_px,
+                    margin_used=margin_used,
+                    leverage=leverage,
+                    unrealized_pnl=u_pnl,
+                    notional=notional,
+                    liquidation_price=liq_px,
+                    margin_mode=margin_mode,
+                    stop_loss_price=Decimal(str(sl_raw)) if sl_raw else None,
+                    take_profit_price=Decimal(str(tp_raw)) if tp_raw else None,
+                )
+            )
+        return out
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[OrderResult]:
+        if not self._api_key or not self._api_secret:
+            raise ExchangeError("Exchange API credentials are not configured.")
+        client = await self._ensure_connected()
+        resolved = self._resolve_symbol(client, symbol) if symbol else None
+        try:
+            raw_orders = await client.fetch_open_orders(resolved) if resolved else await client.fetch_open_orders()
+        except Exception as exc:
+            raise ExchangeError(f"Open orders fetch failed on {self.exchange_id}: {type(exc).__name__}") from exc
+        out: list[OrderResult] = []
+        for raw in raw_orders or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_sym = self._clean_symbol_key(str(raw.get("symbol") or symbol or ""))
+            out.append(self._map_order_result(raw, str(raw.get("clientOrderId") or ""), raw_sym))
+        return out
 
     @staticmethod
     def _clean_symbol_key(raw_sym: str) -> str:
@@ -498,19 +691,41 @@ class CCXTExchangeAdapter(BaseExchange):
         fee_info = res.get("fee") or {}
         ts_ms = res.get("timestamp")
         ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc) if ts_ms else datetime.now(timezone.utc)
-        avg = res.get("average") or res.get("price")
+        info = res.get("info") if isinstance(res.get("info"), dict) else {}
+        raw_avg = res.get("average") or res.get("price") or info.get("avgPrice") or info.get("price")
+        avg_dec: Decimal | None = None
+        if raw_avg not in (None, "", 0, "0"):
+            try:
+                candidate = Decimal(str(raw_avg))
+                if candidate > 0:
+                    avg_dec = candidate
+            except Exception:
+                avg_dec = None
+        if avg_dec is None and filled > 0:
+            cost_val = res.get("cost") or info.get("cumQuote") or info.get("cummulativeQuoteQty")
+            if cost_val not in (None, "", 0, "0"):
+                try:
+                    cost_dec = Decimal(str(cost_val))
+                    if cost_dec > 0:
+                        avg_dec = (cost_dec / filled).quantize(Decimal("0.00000001"))
+                except Exception:
+                    pass
         return OrderResult(
             exchange_order_id=str(res.get("id") or ""),
             client_order_id=str(res.get("clientOrderId") or fallback_client_id),
-            symbol=res.get("symbol") or symbol,
+            symbol=CCXTExchangeAdapter._clean_symbol_key(str(res.get("symbol") or symbol)),
             side=str(res.get("side") or "BUY").upper(),
             order_type=str(res.get("type") or "MARKET").upper(),
             status=mapped_status,
             requested_quantity=amount,
             filled_quantity=filled,
-            average_price=Decimal(str(avg)) if avg else None,
+            average_price=avg_dec,
             fee=Decimal(str(fee_info.get("cost") or 0)),
             fee_asset=str(fee_info.get("currency") or "USDT"),
             timestamp=ts,
-            raw={"id": res.get("id"), "status": raw_status},
+            raw={
+                "id": res.get("id"),
+                "status": raw_status,
+                "stopPrice": res.get("stopPrice") or res.get("triggerPrice") or info.get("stopPrice"),
+            },
         )

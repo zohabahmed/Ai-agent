@@ -53,6 +53,7 @@ from app.market.universe_discovery import (
     get_pinned_watchlist,
 )
 from app.portfolio.balance_manager import BalanceManager
+from app.portfolio.equity_calculator import EquityCalculator
 from app.portfolio.portfolio_manager import PortfolioManager
 from app.risk.daily_baseline import sync_utc_day_baseline
 from app.risk.position_sizer import effective_isolated_leverage
@@ -777,7 +778,27 @@ class AutonomousTradingLoop:
                     pass
 
             locked_quote = await bal_mgr.get_quote_locked(account.id, account.quote_currency)
-            equity_est = avail_quote + locked_quote + current_open_notional
+            pos_tuples = [
+                (
+                    p.quantity,
+                    p.entry_price,
+                    latest_prices.get(p.symbol, p.current_price),
+                    p.entry_fee,
+                    p.side,
+                    p.market_type,
+                    p.margin_used,
+                )
+                for p in open_positions
+            ]
+            latest_snap = await repo.get_latest_snapshot(account.id)
+            equity_est = EquityCalculator.calculate_mixed(
+                initial_capital=account.initial_capital,
+                available_quote=avail_quote,
+                locked_quote=locked_quote,
+                positions=pos_tuples,
+                realized_pnl=latest_snap.realized_pnl if latest_snap else Decimal("0"),
+                total_fees=Decimal("0"),
+            ).total_equity
             sync_utc_day_baseline(account, equity_est)
             use_micro_rules = (
                 not self.settings.paper_enforce_real_exchange_rules
@@ -865,15 +886,22 @@ class AutonomousTradingLoop:
                     market_type="FUTURES",
                     leverage=trade_leverage,
                 )
-                if outcome.executed and outcome.result and outcome.result.average_price:
+                if outcome.executed and outcome.result:
+                    fill_px = (
+                        outcome.result.average_price
+                        if outcome.result.average_price and outcome.result.average_price > Decimal("0")
+                        else (snap.ticker.last if snap.ticker.last > Decimal("0") else best_opp.signal.entry_price)
+                    )
+                    if outcome.order is not None and outcome.order.average_fill_price is None and fill_px > Decimal("0"):
+                        outcome.order.average_fill_price = fill_px
                     orders_submitted += 1
                     pos_side = "SHORT" if entry_side == "SELL" else "LONG"
-                    notional = outcome.result.filled_quantity * outcome.result.average_price
-                    margin_used = notional / Decimal(trade_leverage)
+                    notional = outcome.result.filled_quantity * fill_px
+                    margin_used = notional / Decimal(trade_leverage) if fill_px > Decimal("0") else Decimal("0")
                     stop_dist_pct = Decimal(
                         str(
                             (best_opp.signal.indicators or {}).get("initial_stop_distance_pct")
-                            or (abs(outcome.result.average_price - best_opp.signal.stop_loss) / outcome.result.average_price)
+                            or (abs(fill_px - best_opp.signal.stop_loss) / fill_px if fill_px > Decimal("0") else Decimal("0.01"))
                         )
                     )
                     atr_entry = Decimal(str((best_opp.signal.indicators or {}).get("atr") or 0)) or None
@@ -903,7 +931,7 @@ class AutonomousTradingLoop:
                         strategy_name=best_opp.signal.strategy,
                         trading_mode=trading_mode.value,
                         quantity=outcome.result.filled_quantity,
-                        entry_price=outcome.result.average_price,
+                        entry_price=fill_px,
                         entry_fee=outcome.result.fee,
                         stop_loss=best_opp.signal.stop_loss,
                         take_profit=best_opp.signal.take_profit,
@@ -922,7 +950,7 @@ class AutonomousTradingLoop:
                             "symbol": symbol,
                             "side": pos_side,
                             "leverage": trade_leverage,
-                            "fill_price": float(outcome.result.average_price),
+                            "fill_price": float(fill_px),
                             "notional_usd": float(notional),
                             "margin_usd": float(margin_used),
                             "sl_order_id": sl_oid,

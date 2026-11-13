@@ -313,6 +313,10 @@ export default function ActiveTradeOnlyPage() {
                   <span className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-bold text-emerald-300">
                     Exchange STOP_MARKET + TP Protected
                   </span>
+                ) : selectedTrade.trading_mode === "LIVE_TRADING" || selectedTrade.trading_mode === "TESTNET" ? (
+                  <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold text-amber-300">
+                    Worker Exit Monitor (Exchange Triggers Pending)
+                  </span>
                 ) : (
                   <span className="rounded-md border border-slate-700 bg-slate-800/70 px-2.5 py-1 text-[11px] font-semibold text-slate-300">
                     Simulated Paper Exits

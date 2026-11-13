@@ -88,6 +88,23 @@ class ExchangeBalance:
 
 
 @dataclass(frozen=True)
+class ExchangePosition:
+    symbol: str
+    side: str  # LONG / SHORT
+    quantity: Decimal
+    entry_price: Decimal
+    mark_price: Decimal
+    margin_used: Decimal
+    leverage: Decimal
+    unrealized_pnl: Decimal
+    notional: Decimal = Decimal("0")
+    liquidation_price: Decimal | None = None
+    margin_mode: str = "isolated"
+    stop_loss_price: Decimal | None = None
+    take_profit_price: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class OrderRequest:
     symbol: str
     side: str  # BUY / SELL
@@ -190,3 +207,11 @@ class BaseExchange(ABC):
     async def fetch_all_tickers(self, quote: str = "USDT") -> dict[str, Ticker]:
         """Batch-fetch tickers across active markets for global opportunity scanning."""
         return {}
+
+    async def fetch_positions(self) -> list[ExchangePosition]:
+        """Fetch live open derivative positions from the exchange (empty fallback for Spot/mocks)."""
+        return []
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[OrderResult]:
+        """Fetch open orders (e.g. STOP_MARKET / TAKE_PROFIT_MARKET) for reconciliation."""
+        return []

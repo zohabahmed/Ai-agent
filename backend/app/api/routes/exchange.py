@@ -188,6 +188,7 @@ async def sync_exchange_balances(
             "quote_currency": sync.quote_currency,
             "available_quote": float(sync.available_quote),
             "total_quote": float(sync.total_quote),
+            "positions_synced": sync.positions_synced,
             "balances": sync.balances,
         },
     }

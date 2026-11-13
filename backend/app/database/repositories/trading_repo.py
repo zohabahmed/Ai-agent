@@ -97,11 +97,12 @@ class TradingRepository:
         asset: str,
         available: Decimal,
         locked: Decimal = Decimal("0"),
+        total: Decimal | None = None,
     ) -> Balance:
         stmt = select(Balance).where(Balance.account_id == account_id, Balance.asset == asset)
         res = await self.session.execute(stmt)
         bal = res.scalar_one_or_none()
-        total = available + locked
+        computed_total = total if total is not None else available + locked
         now = datetime.now(timezone.utc)
         if bal is None:
             bal = Balance(
@@ -109,14 +110,14 @@ class TradingRepository:
                 asset=asset,
                 available=available,
                 locked=locked,
-                total=total,
+                total=computed_total,
                 reconciled_at=now,
             )
             self.session.add(bal)
         else:
             bal.available = available
             bal.locked = locked
-            bal.total = total
+            bal.total = computed_total
             bal.reconciled_at = now
         await self.session.flush()
         return bal

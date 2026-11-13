@@ -160,8 +160,39 @@ class ExecutionEngine:
                     )
                 result = await self.exchange.create_order(request)
         except ExchangeError as exc:
+            err_msg = str(exc)
+            lowered = err_msg.lower()
+            deterministic_reject = any(
+                marker in lowered
+                for marker in (
+                    "insufficientfunds",
+                    "insufficient balance",
+                    "margin is insufficient",
+                    "-2019",
+                    "-2010",
+                    "read-only mode",
+                    "below exchange minimum",
+                    "invalidorder",
+                    "min_notional",
+                    "precision",
+                    "permissiondenied",
+                    "not configured",
+                )
+            )
+            if deterministic_reject:
+                order.status = "REJECTED"
+                order.error_message = err_msg
+                await session.flush()
+                return ExecutionOutcome(
+                    executed=False,
+                    duplicate_skipped=False,
+                    ambiguous_error=False,
+                    order=order,
+                    result=None,
+                    reason=f"Exchange rejected order: {err_msg}",
+                )
             order.status = "OPEN"  # Ambiguous state: require reconciliation before retry
-            order.error_message = str(exc)
+            order.error_message = err_msg
             await session.flush()
             return ExecutionOutcome(
                 executed=False,

@@ -138,15 +138,17 @@ async def start_trading(
                     reset_baseline_from_exchange=False,
                 )
     avail = await bal_mgr.get_quote_available(account.id, account.quote_currency)
+    locked = await bal_mgr.get_quote_locked(account.id, account.quote_currency)
+    total_bal = avail + locked
     warning: str | None = None
-    if avail > Decimal("0") and not account.emergency_stopped and account.survival_state == "HALTED":
-        account.peak_equity = max(account.peak_equity, avail)
+    if total_bal > Decimal("0") and not account.emergency_stopped and account.survival_state == "HALTED":
+        account.peak_equity = max(account.peak_equity, total_bal)
         if account.initial_capital <= Decimal("0"):
-            account.initial_capital = avail
+            account.initial_capital = total_bal
         account.survival_state = "NORMAL"
         survival.state = SurvivalState.NORMAL
 
-    if avail <= Decimal("0"):
+    if total_bal <= Decimal("0"):
         warning = (
             f"{account.exchange.upper()} Futures wallet has 0.00 {account.quote_currency}. "
             "Transfer USDT to your Futures wallet and click Sync Live Balance."
@@ -675,17 +677,24 @@ async def _execute_controlled_futures_trade(
                 market_type=account.market_type,
                 leverage=pos_lev,
             )
-            if outcome.executed and outcome.result and outcome.result.average_price:
+            if outcome.executed and outcome.result:
+                fill_px = (
+                    outcome.result.average_price
+                    if outcome.result.average_price and outcome.result.average_price > Decimal("0")
+                    else (snap.ticker.last if snap.ticker.last > Decimal("0") else chosen_signal.entry_price)
+                )
+                if outcome.order is not None and outcome.order.average_fill_price is None and fill_px > Decimal("0"):
+                    outcome.order.average_fill_price = fill_px
                 pos_side = "SHORT" if entry_side == "SELL" else "LONG"
                 margin_used = (
-                    (outcome.result.filled_quantity * outcome.result.average_price) / Decimal(pos_lev)
-                    if is_futures
+                    (outcome.result.filled_quantity * fill_px) / Decimal(pos_lev)
+                    if is_futures and fill_px > Decimal("0")
                     else Decimal("0")
                 )
                 stop_dist_pct = Decimal(
                     str(
                         (chosen_signal.indicators or {}).get("initial_stop_distance_pct")
-                        or (abs(outcome.result.average_price - chosen_signal.stop_loss) / outcome.result.average_price)
+                        or (abs(fill_px - chosen_signal.stop_loss) / fill_px if fill_px > Decimal("0") else Decimal("0.01"))
                     )
                 )
                 atr_entry = Decimal(str((chosen_signal.indicators or {}).get("atr") or 0)) or None
@@ -707,7 +716,7 @@ async def _execute_controlled_futures_trade(
                     strategy_name=chosen_signal.strategy,
                     trading_mode=trading_mode.value,
                     quantity=outcome.result.filled_quantity,
-                    entry_price=outcome.result.average_price,
+                    entry_price=fill_px,
                     entry_fee=outcome.result.fee,
                     stop_loss=chosen_signal.stop_loss,
                     take_profit=chosen_signal.take_profit,
@@ -737,8 +746,8 @@ async def _execute_controlled_futures_trade(
                     "leverage": pos_lev,
                     "strategy": chosen_signal.strategy,
                     "filled_quantity": float(outcome.result.filled_quantity),
-                    "fill_price": float(outcome.result.average_price),
-                    "notional_usd": float(outcome.result.filled_quantity * outcome.result.average_price),
+                    "fill_price": float(fill_px),
+                    "notional_usd": float(outcome.result.filled_quantity * fill_px),
                     "fee_usd": float(outcome.result.fee),
                     "stop_loss": float(chosen_signal.stop_loss),
                     "take_profit": float(chosen_signal.take_profit),

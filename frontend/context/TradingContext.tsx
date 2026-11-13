@@ -210,13 +210,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       "sync-bal",
       () =>
         TradingApi.syncExchangeBalances(token) as Promise<{
-          available_quote?: number;
           exchange_id?: string;
+          sync?: {
+            total_quote?: number;
+            available_quote?: number;
+            positions_synced?: number;
+          };
         }>,
-      (r) =>
-        `Synced ${(r?.exchange_id || "exchange").toUpperCase()} Futures balance: $${(
-          r?.available_quote ?? 0
-        ).toFixed(2)} USDT`
+      (r) => {
+        const total = r?.sync?.total_quote ?? r?.sync?.available_quote ?? 0;
+        const posCount = r?.sync?.positions_synced ?? 0;
+        const posLabel = posCount > 0 ? ` · ${posCount} open position${posCount === 1 ? "" : "s"}` : "";
+        return `Synced ${(r?.exchange_id || "exchange").toUpperCase()} Futures: $${total.toFixed(2)} USDT${posLabel}`;
+      }
     );
   }, [runAction, token]);
 
